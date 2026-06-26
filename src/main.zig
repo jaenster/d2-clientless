@@ -745,38 +745,74 @@ pub fn main(init: std.process.Init.Minimal) !void {
             pace();
             try writeAll(gsfd, &gl);
             std.debug.print("[GS] -> GAMELOGON (0x68) token=0x{x} char=\"{s}\"\n", .{ gtoken, charname });
-            var gbuf: [8192]u8 = undefined;
-            const n1 = read(gsfd, gbuf[0..].ptr, gbuf.len);
-            if (n1 <= 0) {
-                std.debug.print("[GS] no response to GAMELOGON — refused/closed (try --verbyte)\n", .{});
-                return;
-            }
-            std.debug.print("[GS] <- {d} bytes after GAMELOGON (GS accepted + streaming)\n", .{n1});
-            rawDump(gbuf[0..@intCast(n1)]);
-            // Give the GS time to finish setting up the game before joining (the engine
-            // expects a beat here; firing 0x6b instantly can truncate the world load).
-            pace();
-            try writeAll(gsfd, &[_]u8{0x6b}); // JOINGAME (0x6b), 1 byte
-            std.debug.print("[GS] -> JOINGAME (0x6b)\n", .{});
-            // Drain the world stream for ~3s: a real game-load streams kilobytes of
-            // (huffman-compressed) world/unit data; a refused join sends little then closes.
-            setRecvTimeout(gsfd, 800);
-            var total: usize = @intCast(n1);
-            var reads: usize = 0;
-            const deadline = nowMs() + 3000;
+            // Parse the S->C game stream the way the real client does. The real client sends
+            // JOINGAME(0x6b) ONLY in response to the server's 0x02 (LoadSuccess) packet
+            // (NET_D2GS_CLIENT_Incoming0x02_LoadSuccess @0x45c910), not blindly. Framing
+            // (NET_D2GS_SERVER_SendPacketToClient @0x52b330): packet 0xAF is the raw connection
+            // handshake (no length prefix); every other packet is length-prefixed — 1 byte if
+            // <0xF0 (frame = that many bytes total), else 2 bytes [0xF0|hi][lo]. Run the GS with
+            // --no-compress so payloads are verbatim (no Huffman) and the ids are readable here.
+            setRecvTimeout(gsfd, 1500);
+            var sbuf: [32768]u8 = undefined;
+            var slen: usize = 0;
+            var handshook = false;
+            var sent6b = false;
+            var world_bytes: usize = 0;
+            var pkt_count: usize = 0;
+            const deadline = nowMs() + 8000;
             while (nowMs() < deadline) {
-                const nr = read(gsfd, gbuf[0..].ptr, gbuf.len);
+                var off: usize = 0;
+                while (off < slen) {
+                    const b0 = sbuf[off];
+                    if (!handshook and b0 == 0xAF) { // raw 0xAF connection handshake
+                        if (slen - off < 2) break;
+                        std.debug.print("[GS] <- 0xAF connection handshake\n", .{});
+                        rawDump(sbuf[off .. off + 2]);
+                        off += 2;
+                        handshook = true;
+                        continue;
+                    }
+                    var hdr: usize = 1;
+                    var total: usize = b0;
+                    if (b0 >= 0xF0) {
+                        if (slen - off < 2) break;
+                        hdr = 2;
+                        total = ((@as(usize, b0) & 0x0F) << 8) | sbuf[off + 1];
+                    }
+                    if (total <= hdr or total > sbuf.len) { // malformed — resync one byte
+                        off += 1;
+                        continue;
+                    }
+                    if (slen - off < total) break; // wait for the rest of the frame
+                    const id = sbuf[off + hdr];
+                    std.debug.print("[GS] <- packet 0x{x:0>2} ({d} bytes)\n", .{ id, total });
+                    rawDump(sbuf[off .. off + total]);
+                    pkt_count += 1;
+                    if (sent6b) world_bytes += total;
+                    if (id == 0x02 and !sent6b) { // LoadSuccess -> send JOINGAME, like the real client
+                        pace();
+                        try writeAll(gsfd, &[_]u8{0x6b});
+                        sent6b = true;
+                        std.debug.print("[GS] -> JOINGAME (0x6b)  (in response to 0x02 LoadSuccess)\n", .{});
+                    }
+                    off += total;
+                }
+                if (off > 0) {
+                    std.mem.copyForwards(u8, sbuf[0 .. slen - off], sbuf[off..slen]);
+                    slen -= off;
+                }
+                const nr = read(gsfd, sbuf[slen..].ptr, sbuf.len - slen);
                 if (nr == 0) {
-                    std.debug.print("[GS] connection closed by GS (total {d} B over {d} reads)\n", .{ total, reads });
+                    std.debug.print("[GS] connection closed by GS ({d} packets, sent6b={})\n", .{ pkt_count, sent6b });
                     return;
                 }
                 if (nr < 0) continue; // timeout tick
-                std.debug.print("[GS] <- chunk {d}: {d} bytes\n", .{ reads, nr });
-                rawDump(gbuf[0..@intCast(nr)]);
-                total += @intCast(nr);
-                reads += 1;
+                slen += @intCast(nr);
             }
-            std.debug.print("[GS] world stream: {d} bytes over {d} reads, connection still open  => IN GAME\n", .{ total, reads });
+            if (sent6b)
+                std.debug.print("[GS] joined: {d} packets, {d} world bytes after 0x6b  => IN GAME\n", .{ pkt_count, world_bytes })
+            else
+                std.debug.print("[GS] never saw 0x02 LoadSuccess ({d} packets) — 0x6b not sent\n", .{pkt_count});
             return;
         }
 
