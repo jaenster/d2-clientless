@@ -347,7 +347,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var delay_sec: u32 = 0; // wait N seconds after joining before say/kick (2-client ordering)
     var game_arg: ?[]const u8 = null; // --game <name>: create+join the game and enter it on the GS
     var gs_port: u16 = 4000; // GS game port (qqserver public port)
-    var ver_byte: u8 = 0; // GAMELOGON version byte (GetGameVersion)
+    var ver_byte: u8 = 0x0e; // GAMELOGON nVerByte — GET_GameVersion() returns 0xe (14) for 1.14d
     var bnet_port: u16 = 6112; // BNCS port to connect to (--port)
     var pos: usize = 0;
     while (args.next()) |a| {
