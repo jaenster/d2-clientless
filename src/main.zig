@@ -40,6 +40,18 @@ fn nowMs() i64 {
     _ = gettimeofday(&tv, null);
     return @as(i64, @intCast(tv.sec)) * 1000 + @divTrunc(@as(i64, @intCast(tv.usec)), 1000);
 }
+
+// --delay: pause before each protocol step. Real clients don't fire packets back-to-back;
+// pacing avoids tripping server-side rate limits and gives the GS time to set up the game.
+var step_delay_ms: u64 = 0;
+const c_timespec = extern struct { tv_sec: c_long, tv_nsec: c_long };
+extern "c" fn nanosleep(req: *const c_timespec, rem: ?*c_timespec) c_int;
+fn pace() void {
+    if (step_delay_ms == 0) return;
+    const ts = c_timespec{ .tv_sec = @intCast(step_delay_ms / 1000), .tv_nsec = @intCast((step_delay_ms % 1000) * 1_000_000) };
+    _ = nanosleep(&ts, null);
+}
+
 fn writeAll(fd: Socket, buf: []const u8) !void {
     var sent: usize = 0;
     while (sent < buf.len) {
@@ -119,6 +131,22 @@ fn dumpPkt(proto: []const u8, id: u8, body: []const u8) void {
     }
 }
 
+// Raw hexdump (offset + hex + ascii), for unframed streams like the GS game protocol.
+fn rawDump(bytes: []const u8) void {
+    if (!verbose) return;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 16) {
+        const end = @min(i + 16, bytes.len);
+        std.debug.print("    {x:0>4}  ", .{i});
+        for (bytes[i..end]) |b| std.debug.print("{x:0>2} ", .{b});
+        var pad = end;
+        while (pad < i + 16) : (pad += 1) std.debug.print("   ", .{});
+        std.debug.print(" |", .{});
+        for (bytes[i..end]) |b| std.debug.print("{c}", .{if (b >= 0x20 and b < 0x7f) b else '.'});
+        std.debug.print("|\n", .{});
+    }
+}
+
 /// Read framed BNCS packets until one with id == want; auto-echo SID_PING.
 fn recvUntil(fd: Socket, want: u8, out: []u8) ![]const u8 {
     while (true) {
@@ -153,6 +181,7 @@ fn recvUntil(fd: Socket, want: u8, out: []u8) ![]const u8 {
 }
 
 fn send(fd: Socket, id: u8, body: []const u8) !void {
+    pace();
     var hdr: [4]u8 = .{ 0xFF, id, 0, 0 };
     std.mem.writeInt(u16, hdr[2..4], @intCast(body.len + 4), .little);
     try writeAll(fd, &hdr);
@@ -236,6 +265,7 @@ fn pumpEvents(fd: Socket) i32 {
 var mrx: [16384]u8 = undefined;
 var mrxlen: usize = 0;
 fn mcpSend(fd: Socket, id: u8, body: []const u8) !void {
+    pace();
     var hdr: [3]u8 = undefined;
     std.mem.writeInt(u16, hdr[0..2], @intCast(body.len + 3), .little);
     hdr[2] = id;
@@ -320,6 +350,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             ver_byte = std.fmt.parseInt(u8, args.next() orelse "0", 10) catch 0;
         } else if (std.mem.eql(u8, a, "--port")) {
             bnet_port = std.fmt.parseInt(u16, args.next() orelse "6112", 10) catch 6112;
+        } else if (std.mem.eql(u8, a, "--delay")) {
+            step_delay_ms = std.fmt.parseInt(u64, args.next() orelse "0", 10) catch 0;
         } else if (std.mem.eql(u8, a, "--verbose")) {
             verbose = true;
         } else if (!std.mem.startsWith(u8, a, "--")) {
@@ -349,6 +381,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\  --kick <user>      /kick a user (channel operator)
             \\  --listen <sec>     stay in chat reading events for N seconds
             \\  --sig0             report sigOk=0 in CheckRevision
+            \\  --delay <ms>       pause before each step (gentler pacing; e.g. 500)
             \\  --verbose          hexdump all BNCS + MCP traffic
             \\
         , .{});
@@ -709,6 +742,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             gl[16] = 0; // language code
             gl[17] = 1; // char class (Sorceress — matches our created char)
             @memcpy(gl[18..][0..@min(charname.len, 18)], charname[0..@min(charname.len, 18)]);
+            pace();
             try writeAll(gsfd, &gl);
             std.debug.print("[GS] -> GAMELOGON (0x68) token=0x{x} char=\"{s}\"\n", .{ gtoken, charname });
             var gbuf: [8192]u8 = undefined;
@@ -718,6 +752,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 return;
             }
             std.debug.print("[GS] <- {d} bytes after GAMELOGON (GS accepted + streaming)\n", .{n1});
+            rawDump(gbuf[0..@intCast(n1)]);
+            // Give the GS time to finish setting up the game before joining (the engine
+            // expects a beat here; firing 0x6b instantly can truncate the world load).
+            pace();
             try writeAll(gsfd, &[_]u8{0x6b}); // JOINGAME (0x6b), 1 byte
             std.debug.print("[GS] -> JOINGAME (0x6b)\n", .{});
             // Drain the world stream for ~3s: a real game-load streams kilobytes of
@@ -733,6 +771,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     return;
                 }
                 if (nr < 0) continue; // timeout tick
+                std.debug.print("[GS] <- chunk {d}: {d} bytes\n", .{ reads, nr });
+                rawDump(gbuf[0..@intCast(nr)]);
                 total += @intCast(nr);
                 reads += 1;
             }

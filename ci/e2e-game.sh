@@ -32,8 +32,9 @@ if [ -n "${STACK_HOST:-}" ]; then
   PORT="${STACK_PORT:-6112}"; GSPORT="${STACK_GSPORT:-4000}"
   echo "targeting running stack ${STACK_HOST}:${PORT} (game edge :${GSPORT})"
   OUT="$(timeout 60 "$CLIENT" "$STACK_HOST" D2XP 1.14.3.71 --port "$PORT" --gs-port "$GSPORT" \
-        ${KEYS:+--keys "$KEYS"} --create e2e:pw --game "$GAME" 2>&1 || true)"
+        ${KEYS:+--keys "$KEYS"} ${VERBOSE:+--verbose} --create e2e:pw --game "$GAME" 2>&1 || true)"
   echo "$OUT" | grep -vE '^\s+[0-9a-f]{2} '
+  [ -n "${LOGDIR:-}" ] && { mkdir -p "$LOGDIR"; printf '%s\n' "$OUT" > "$LOGDIR/client.log"; echo "client log -> $LOGDIR/client.log"; }
   assert_entry "$OUT"
   exit 0
 fi
@@ -54,6 +55,7 @@ REALMD_GS_PORT="$((P+3))" REALMD_HEALTH_PORT="$((P+4))" \
 REALMD_GAME_PORT="$EDGE" REALMD_QQ_PORT="$EDGE" \
 REALMD_REALM_ADDR=127.0.0.1 REALMD_GAME_ADDR=127.0.0.1 \
 REALMD_MODERN_CHALLENGE=1 REALMD_PERMISSIVE_AUTH=1 REALMD_SEED_ACCOUNTS='e2e:pw' \
+REALMD_TRACE="${VERBOSE:+1}" \
   "$D2_DIR/zig-out/bin/realmd" > "$RLOG" 2>&1 &
 RPID=$!
 for _ in $(seq 1 60); do grep -q listening "$RLOG" && break; sleep 0.5; done
@@ -69,6 +71,12 @@ for _ in $(seq 1 60); do grep -qi 'registered' "$RLOG" && break; sleep 1; done
 grep -qi 'registered' "$RLOG" || { echo "GS did not register"; tail -20 "$GLOG"; exit 1; }
 echo "realmd + GS up"
 
-OUT="$(timeout 60 "$CLIENT" 127.0.0.1 D2XP 1.14.3.71 --port "$P" --gs-port "$EDGE" --create e2e:pw --game "$GAME" 2>&1 || true)"
+OUT="$(timeout 60 "$CLIENT" 127.0.0.1 D2XP 1.14.3.71 --port "$P" --gs-port "$EDGE" ${VERBOSE:+--verbose} --create e2e:pw --game "$GAME" 2>&1 || true)"
 echo "$OUT" | grep -vE '^\s+[0-9a-f]{2} '
+if [ -n "${LOGDIR:-}" ]; then
+  mkdir -p "$LOGDIR"
+  printf '%s\n' "$OUT" > "$LOGDIR/client.log"
+  cp "$RLOG" "$LOGDIR/realmd.log"; cp "$GLOG" "$LOGDIR/gs.log"
+  echo "logs -> $LOGDIR (client.log, realmd.log, gs.log)"
+fi
 assert_entry "$OUT"
