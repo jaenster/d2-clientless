@@ -35,6 +35,15 @@ Requires Zig 0.16.
 Options: `--port`, `--keys K1,K2`, `--login`/`--create acct:pass`, `--game <name>`
 (`--gs-port`), `--channel/--say/--kick/--listen`, `--sig0`, `--verbose`.
 
+## Container
+
+    docker run --rm ghcr.io/jaenster/d2-clientless <host> D2XP 1.14.3.71 --login acct:pass
+    docker run --rm --entrypoint /bnftp ghcr.io/jaenster/d2-clientless --head <host> D2XP CheckRevision.mpq
+
+The image is multi-arch (linux/amd64 + linux/arm64), static musl on `scratch`. There's no
+native Windows binary yet (the socket layer needs a Winsock port), but Windows and macOS
+users can run the container under Docker Desktop / WSL2.
+
 ## The three hashes
 
 Easy to conflate; they are distinct:
