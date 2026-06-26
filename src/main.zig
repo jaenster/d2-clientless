@@ -731,17 +731,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
             };
             defer _ = close(gsfd);
             setRecvTimeout(gsfd, 5000);
-            // GAMELOGON (0x68), 37 bytes (D2GSPacketClt0x68 — raw, no framing)
+            // GAMELOGON (0x68), 37 bytes — D2GSPacketClt0x68, packed, raw (no framing).
+            // Field offsets are the engine's exact struct, not guesses: the server's
+            // IsValidChecks reads nCharClass@7, nLanguageCode@20, szCharName@21 — a wrong
+            // layout makes the name/class mismatch and the join is silently rejected.
             var gl: [37]u8 = [_]u8{0} ** 37;
-            gl[0] = 0x68;
-            std.mem.writeInt(u32, gl[1..5], ghash, .little);
-            std.mem.writeInt(u16, gl[5..7], gtoken, .little);
-            gl[7] = ver_byte;
-            std.mem.writeInt(u32, gl[8..12], 0xed5fcc50, .little); // expansion version constant
-            std.mem.writeInt(u32, gl[12..16], 0x91a519b6, .little); // constant
-            gl[16] = 0; // language code
-            gl[17] = 1; // char class (Sorceress — matches our created char)
-            @memcpy(gl[18..][0..@min(charname.len, 18)], charname[0..@min(charname.len, 18)]);
+            gl[0] = 0x68; // nId
+            std.mem.writeInt(u32, gl[1..5], ghash, .little); // nGameHash (from JOINGAME)
+            std.mem.writeInt(u16, gl[5..7], gtoken, .little); // nGameToken
+            gl[7] = 1; // nCharClass (Sorceress — matches the char we create)
+            std.mem.writeInt(u32, gl[8..12], ver_byte, .little); // nVerByte (GetGameVersion)
+            std.mem.writeInt(u32, gl[12..16], 0xed5fcc50, .little); // nVersionConstant (expansion)
+            std.mem.writeInt(u32, gl[16..20], 0x91a519b6, .little); // nConstant
+            gl[20] = 0; // nLanguageCode
+            @memcpy(gl[21..][0..@min(charname.len, 16)], charname[0..@min(charname.len, 16)]); // szCharName[16]
             pace();
             try writeAll(gsfd, &gl);
             std.debug.print("[GS] -> GAMELOGON (0x68) token=0x{x} char=\"{s}\"\n", .{ gtoken, charname });
