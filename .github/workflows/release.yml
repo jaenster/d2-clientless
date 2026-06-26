@@ -1,0 +1,46 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Cross-compiled binaries for every platform Zig can target cleanly today: linux
+# (static musl) and macOS, both x86_64 + aarch64. Windows is pending a Winsock port
+# of the socket layer (the client currently uses POSIX sockets/getaddrinfo).
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-linux-musl,  name: linux-x86_64,  os: ubuntu-latest }
+          - { target: aarch64-linux-musl, name: linux-aarch64, os: ubuntu-latest }
+          - { target: x86_64-macos,       name: macos-x86_64,  os: macos-latest }
+          - { target: aarch64-macos,      name: macos-aarch64, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build (${{ matrix.name }})
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+      - name: Package
+        run: |
+          d="clientless-${{ matrix.name }}"
+          mkdir -p "$d"
+          cp zig-out/bin/clientless zig-out/bin/bnftp README.md "$d"/
+          tar -czf "$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: clientless-${{ matrix.name }}.tar.gz
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: clientless-${{ matrix.name }}.tar.gz

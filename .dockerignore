@@ -1,0 +1,4 @@
+.git
+.zig-cache/
+zig-out/
+ci/
