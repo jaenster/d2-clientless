@@ -1,4 +1,8 @@
-.zig-cache/
-zig-out/
+*.log
 *.o
+*log.txt
 .env
+.idea/
+.zig-cache/
+d2run-logs/
+zig-out/
