@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # The d2gs source repo that provides realmd (public: "d2-dedicated-server").
+  # Override via repo variables if your fork/name differs.
+  REALMD_REPO: ${{ vars.REALMD_REPO || 'jaenster/d2-dedicated-server' }}
+  REALMD_REF: ${{ vars.REALMD_REF || 'main' }}
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build (clientless + bnftp)
+        run: zig build
+      - name: Crypto unit tests (CheckRevision / CD-key / xSHA-1)
+        run: zig build test
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout clientless
+        uses: actions/checkout@v4
+      - name: Checkout realmd source (d2gs)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REALMD_REPO }}
+          ref: ${{ env.REALMD_REF }}
+          # token: ${{ secrets.REALMD_TOKEN }}   # uncomment if the source repo is private
+          path: d2gs
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build clientless
+        run: zig build
+      - name: Build realmd
+        run: cd d2gs && zig build realmd-bin
+      - name: Full clientless ↔ realmd E2E
+        run: ./ci/e2e.sh d2gs/zig-out/bin/realmd ./zig-out/bin/clientless
+
+  # Game entry needs a real GS (proprietary Game.exe + data MPQs + wine), which can't
+  # live in public CI — so this runs only on a self-hosted runner that has the D2 files.
+  # Register a runner with the `d2-game` label and set the D2GS_GAME_SRC repo variable
+  # (a D2 install dir with d2data.mpq). Skipped automatically if no such runner exists.
+  e2e-game:
+    if: ${{ vars.D2GS_GAME_SRC != '' }}
+    runs-on: [self-hosted, d2-game]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REALMD_REPO }}
+          ref: ${{ env.REALMD_REF }}
+          path: d2gs
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build clientless
+        run: zig build
+      - name: Clientless game-entry E2E (realmd + GS + GAMELOGON)
+        env:
+          D2_DIR: ${{ github.workspace }}/d2gs
+          D2GS_GAME_SRC: ${{ vars.D2GS_GAME_SRC }}
+        run: ./ci/e2e-game.sh
