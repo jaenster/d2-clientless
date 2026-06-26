@@ -19,6 +19,7 @@ const std = @import("std");
 const core = @import("checkrev_core");
 const cdkey = @import("cdkey");
 const xsha1 = @import("xsha1");
+const huffman = @import("huffman.zig");
 
 // ── libc sockets (native host target; std.net/std.posix wrappers are gone in 0.16) ──
 const Socket = c_int;
@@ -878,7 +879,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     rawDump(sbuf[off .. off + n]);
                     pkt_count += 1;
                     if (sent6b) world_bytes += n;
-                    if (id == 0x02 and !sent6b) { // LoadSuccess -> send JOINGAME, like the real client
+                    if (id == 0xAE and n > 3) { // compressed blob: huffman-decompress + parse inner
+                        var dbuf: [16384]u8 = undefined;
+                        if (huffman.decompress(sbuf[off + 3 .. off + n], &dbuf)) |dlen| {
+                            std.debug.print("    decompressed {d} -> {d} bytes\n", .{ n - 3, dlen });
+                            var io: usize = 0;
+                            while (io < dlen) {
+                                const isz = scPacketSize(dbuf[io..dlen]) orelse break;
+                                if (isz == 0) break;
+                                const iid = dbuf[io];
+                                std.debug.print("    [inner] 0x{x:0>2} ({d} bytes)\n", .{ iid, isz });
+                                if (iid == 0x02 and !sent6b) {
+                                    pace();
+                                    try writeAll(gsfd, &[_]u8{0x6b});
+                                    sent6b = true;
+                                    std.debug.print("[GS] -> JOINGAME (0x6b)  (0x02 inside compressed blob)\n", .{});
+                                }
+                                io += isz;
+                            }
+                        }
+                    }
+                    if (id == 0x02 and !sent6b) { // raw LoadSuccess -> send JOINGAME, like the real client
                         pace();
                         try writeAll(gsfd, &[_]u8{0x6b});
                         sent6b = true;
