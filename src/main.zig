@@ -137,6 +137,59 @@ fn joinGameMeaning(r: u32) []const u8 {
     };
 }
 
+// D2GS server->client packet sizes, opcode 0x00..0xB4 — verbatim from the engine's
+// NET_D2GS_CLIENT_INCOMING_SIZE table @0x730ae8. >0 = fixed wire size; 0 = invalid;
+// -1 = variable (size derived from header fields, see scPacketSize). The game stream is
+// opcode-framed (NOT length-prefixed): [opcode][payload]. 0xAE is the compressed blob.
+const D2GS_SC_SIZE = [_]i16{
+    1,  8,  1,  12, 1,  1,  1,  6,  6,  11, 6,  6,  9,  13, 12, 16, // 0x00
+    16, 8,  26, 14, 18, 11, -1, 0,  15, 2,  2,  3,  5,  3,  4,  6, // 0x10
+    10, 12, 12, 13, 90, 90, -1, 40, 103, 97, 15, 0,  8,  0,  0,  0, // 0x20
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  -1, 8, // 0x30
+    13, 0,  6,  0,  0,  13, 0,  11, 11, 0,  0,  0,  16, 17, 7,  1, // 0x40
+    15, 14, 42, 10, 3,  0,  0,  14, 7,  26, 40, -1, 5,  6,  38, 5, // 0x50
+    7,  2,  7,  21, 0,  7,  7,  16, 21, 12, 12, 16, 16, 10, 1,  1, // 0x60
+    1,  1,  1,  32, 10, 13, 6,  2,  21, 6,  13, 8,  6,  18, 5,  10, // 0x70
+    0,  20, 29, 0,  0,  0,  0,  0,  0,  2,  6,  6,  11, 7,  10, 33, // 0x80
+    13, 26, 6,  8,  -1, 13, 9,  1,  7,  16, 17, 7,  -1, -1, 7,  8, // 0x90
+    10, 7,  8,  24, 3,  8,  -1, 7,  -1, 7,  -1, 7,  -1, 0,  -1, -1, // 0xA0
+    1,  0,  53, -1, 5, // 0xB0..0xB4
+};
+
+// Full wire size of the S->C packet at the front of `buf`, or null if the complete
+// packet isn't present yet (need more bytes). 0 return = invalid opcode (desync).
+fn scPacketSize(buf: []const u8) ?usize {
+    if (buf.len == 0) return null;
+    const op = buf[0];
+    if (op > 0xb4) return 0; // invalid
+    const t = D2GS_SC_SIZE[op];
+    if (t == 0) return 0; // unknown/invalid opcode
+    if (t > 0) { // fixed size
+        const n: usize = @intCast(t);
+        return if (buf.len >= n) n else null;
+    }
+    // variable-length: derive from header fields (engine GetIncomingPacketSize switch)
+    const sz: ?usize = switch (op) {
+        0x16, 0x5b => if (buf.len > 2) @as(usize, std.mem.readInt(u16, buf[1..3], .little)) else null,
+        0x3e => if (buf.len > 1) @as(usize, buf[1]) else null,
+        0x94 => if (buf.len > 1) (@as(usize, buf[1]) + 2) * 3 else null,
+        0x9c, 0x9d => if (buf.len > 2) @as(usize, buf[2]) else null,
+        0xa6 => if (buf.len > 3) @as(usize, std.mem.readInt(u16, buf[2..4], .little)) else null,
+        0xa8, 0xaa => if (buf.len > 6) @as(usize, buf[6]) else null,
+        0xac => if (buf.len > 0xc) @as(usize, buf[0xc]) else null,
+        0xae => if (buf.len > 2) blk: { // compressed blob
+            var raw = std.mem.readInt(u16, buf[1..3], .little);
+            if (raw > 0x1fd) raw = 0;
+            break :blk @as(usize, raw) + 3;
+        } else null,
+        0xaf => if (buf.len > 1) (if (buf[1] == 0) @as(usize, 2) else @as(usize, buf[1]) + 1) else null,
+        0xb3 => if (buf.len > 7) @as(usize, buf[1]) + 7 else null,
+        else => return 0, // 0x26 SSTR-string packet — not expected pre-entry; treat as desync
+    };
+    const need = sz orelse return null;
+    return if (buf.len >= need) need else null;
+}
+
 var rxbuf: [16384]u8 = undefined;
 var rxlen: usize = 0;
 
@@ -813,39 +866,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
             while (nowMs() < deadline) {
                 var off: usize = 0;
                 while (off < slen) {
-                    const b0 = sbuf[off];
-                    if (!handshook and b0 == 0xAF) { // raw 0xAF connection handshake
-                        if (slen - off < 2) break;
-                        std.debug.print("[GS] <- 0xAF connection handshake\n", .{});
-                        rawDump(sbuf[off .. off + 2]);
-                        off += 2;
-                        handshook = true;
-                        continue;
-                    }
-                    var hdr: usize = 1;
-                    var total: usize = b0;
-                    if (b0 >= 0xF0) {
-                        if (slen - off < 2) break;
-                        hdr = 2;
-                        total = ((@as(usize, b0) & 0x0F) << 8) | sbuf[off + 1];
-                    }
-                    if (total <= hdr or total > sbuf.len) { // malformed — resync one byte
+                    const n = scPacketSize(sbuf[off..slen]) orelse break; // need more bytes
+                    if (n == 0) { // invalid opcode = desync; resync one byte
+                        std.debug.print("[GS] <- desync at 0x{x:0>2}, resyncing\n", .{sbuf[off]});
                         off += 1;
                         continue;
                     }
-                    if (slen - off < total) break; // wait for the rest of the frame
-                    const id = sbuf[off + hdr];
-                    std.debug.print("[GS] <- packet 0x{x:0>2} ({d} bytes)\n", .{ id, total });
-                    rawDump(sbuf[off .. off + total]);
+                    const id = sbuf[off];
+                    const tag = if (id == 0xAE) " (compressed blob)" else "";
+                    std.debug.print("[GS] <- packet 0x{x:0>2} ({d} bytes){s}\n", .{ id, n, tag });
+                    rawDump(sbuf[off .. off + n]);
                     pkt_count += 1;
-                    if (sent6b) world_bytes += total;
+                    if (sent6b) world_bytes += n;
                     if (id == 0x02 and !sent6b) { // LoadSuccess -> send JOINGAME, like the real client
                         pace();
                         try writeAll(gsfd, &[_]u8{0x6b});
                         sent6b = true;
                         std.debug.print("[GS] -> JOINGAME (0x6b)  (in response to 0x02 LoadSuccess)\n", .{});
                     }
-                    off += total;
+                    off += n;
                 }
                 if (off > 0) {
                     std.mem.copyForwards(u8, sbuf[0 .. slen - off], sbuf[off..slen]);
