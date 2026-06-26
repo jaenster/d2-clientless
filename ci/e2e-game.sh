@@ -73,7 +73,7 @@ for f in "$D2GS_GAME_SRC"/*; do [ -f "$f" ] && ln -f "$f" "$GDIR/$(basename "$f"
 cp "$D2_DIR/zig-out/bin/dbghelp.dll" "$D2_DIR/zig-out/bin/d2gs.dll" "$GDIR/"
 DLL="Z:$(echo "$GDIR/d2gs.dll" | tr '/' '\\')"
 ( cd "$GDIR" && WINEDEBUG=-all WINEDLLOVERRIDES="dbghelp=n" "$WINE" Game.exe -w -nosound --headless \
-    --loaddll "$DLL" --d2gs --d2gs-boot --create-games --no-compress \
+    --loaddll "$DLL" --d2gs --d2gs-boot --realm --create-games --no-compress \
     --d2cs "127.0.0.1:$((P+3))" --d2dbs "127.0.0.1:$((P+2))" --gs-addr "$GSADDR" > "$GLOG" 2>&1 ) &
 for _ in $(seq 1 60); do grep -qi 'registered' "$RLOG" && break; sleep 1; done
 grep -qi 'registered' "$RLOG" || { echo "GS did not register"; tail -20 "$GLOG"; exit 1; }

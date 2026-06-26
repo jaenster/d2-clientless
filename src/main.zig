@@ -756,11 +756,42 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 return;
             };
             defer _ = close(gsfd);
-            setRecvTimeout(gsfd, 5000);
-            // GAMELOGON (0x68), 37 bytes — D2GSPacketClt0x68, packed, raw (no framing).
-            // Field offsets are the engine's exact struct, not guesses: the server's
-            // IsValidChecks reads nCharClass@7, nLanguageCode@20, szCharName@21 — a wrong
-            // layout makes the name/class mismatch and the join is silently rejected.
+            setRecvTimeout(gsfd, 2000);
+            var sbuf: [32768]u8 = undefined;
+            var slen: usize = 0;
+            var handshook = false;
+            var sent6b = false;
+            var world_bytes: usize = 0;
+            var pkt_count: usize = 0;
+
+            // Real-client sequence: WAIT for the GS's 0xAF connection-established packet
+            // (D2GS_Connected) BEFORE sending GAMELOGON. pfModes_EnterGame only sends 0x68
+            // after the connecting loop sees D2GS_Connected=1 — firing 0x68 before the raw GS
+            // finishes its accept handshake gets the connection dropped (what asia does).
+            {
+                const hs_deadline = nowMs() + 5000;
+                while (!handshook and nowMs() < hs_deadline) {
+                    if (slen >= 2 and sbuf[0] == 0xAF) {
+                        std.debug.print("[GS] <- 0xAF connection established (D2GS_Connected)\n", .{});
+                        rawDump(sbuf[0..2]);
+                        std.mem.copyForwards(u8, sbuf[0 .. slen - 2], sbuf[2..slen]);
+                        slen -= 2;
+                        handshook = true;
+                        break;
+                    }
+                    const nr = read(gsfd, sbuf[slen..].ptr, sbuf.len - slen);
+                    if (nr == 0) {
+                        std.debug.print("[GS] closed before connection handshake\n", .{});
+                        return;
+                    }
+                    if (nr < 0) continue; // timeout tick
+                    slen += @intCast(nr);
+                }
+                if (!handshook) std.debug.print("[GS] no 0xAF within 5s — sending GAMELOGON anyway\n", .{});
+            }
+
+            // GAMELOGON (0x68), 37 bytes — D2GSPacketClt0x68 (packed, raw). Offsets are the
+            // engine's exact struct: nCharClass@7, nVerByte@8, consts@12/16, lang@20, name@21.
             var gl: [37]u8 = [_]u8{0} ** 37;
             gl[0] = 0x68; // nId
             std.mem.writeInt(u32, gl[1..5], ghash, .little); // nGameHash (from JOINGAME)
@@ -774,20 +805,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             pace();
             try writeAll(gsfd, &gl);
             std.debug.print("[GS] -> GAMELOGON (0x68) token=0x{x} char=\"{s}\"\n", .{ gtoken, charname });
-            // Parse the S->C game stream the way the real client does. The real client sends
-            // JOINGAME(0x6b) ONLY in response to the server's 0x02 (LoadSuccess) packet
-            // (NET_D2GS_CLIENT_Incoming0x02_LoadSuccess @0x45c910), not blindly. Framing
-            // (NET_D2GS_SERVER_SendPacketToClient @0x52b330): packet 0xAF is the raw connection
-            // handshake (no length prefix); every other packet is length-prefixed — 1 byte if
-            // <0xF0 (frame = that many bytes total), else 2 bytes [0xF0|hi][lo]. Run the GS with
-            // --no-compress so payloads are verbatim (no Huffman) and the ids are readable here.
+            // Now read the S->C stream and send JOINGAME(0x6b) only on the server's 0x02
+            // LoadSuccess (NET_D2GS_CLIENT_Incoming0x02_LoadSuccess @0x45c910). Length-prefixed
+            // frames (1 byte <0xF0, else 2-byte [0xF0|hi][lo]); run the GS with --no-compress.
             setRecvTimeout(gsfd, 1500);
-            var sbuf: [32768]u8 = undefined;
-            var slen: usize = 0;
-            var handshook = false;
-            var sent6b = false;
-            var world_bytes: usize = 0;
-            var pkt_count: usize = 0;
             const deadline = nowMs() + 8000;
             while (nowMs() < deadline) {
                 var off: usize = 0;
