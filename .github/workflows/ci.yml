@@ -1,8 +1,13 @@
 name: ci
 
 on:
+  # Only run on pushes to main and on PRs — not on every feature-branch push — and skip
+  # docs-only changes. Manual runs via the Actions tab.
   push:
+    branches: [main]
+    paths-ignore: ['**.md', 'install.sh', 'LICENSE']
   pull_request:
+    paths-ignore: ['**.md', 'install.sh', 'LICENSE']
   workflow_dispatch:
 
 env:
