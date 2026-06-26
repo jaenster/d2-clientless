@@ -55,6 +55,12 @@ it runs against real Battle.net too (it was validated end-to-end against a live 
   won't be extended to defeat them on a live service.
 - **One session per run, single-threaded.** No connection pooling, no concurrency.
 
+## Install
+
+Prebuilt native binaries are on the [Releases](https://github.com/jaenster/d2-clientless/releases)
+page for **Linux** (x86_64, aarch64, armv7, riscv64), **macOS** (x86_64, aarch64), and **FreeBSD**
+(x86_64, aarch64). Linux builds are static musl (no dependencies). Or run the [container](#container).
+
 ## Build
 
 Requires **Zig 0.16**. Produces a single binary:
