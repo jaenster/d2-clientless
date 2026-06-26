@@ -110,6 +110,33 @@ fn authMeaning(r: u32) []const u8 {
     };
 }
 
+// MCP_CREATEGAME (0x03) result codes.
+fn createGameMeaning(r: u32) []const u8 {
+    return switch (r) {
+        0x00 => "created (now send JOINGAME)",
+        0x1e => "invalid game name",
+        0x1f => "game already exists",
+        0x20 => "game servers are down",
+        0x6e => "a dead hardcore character cannot create games",
+        else => "failed (unknown / no GS available)",
+    };
+}
+
+// MCP_JOINGAME (0x04) result codes.
+fn joinGameMeaning(r: u32) []const u8 {
+    return switch (r) {
+        0x00 => "OK",
+        0x29 => "password incorrect",
+        0x2a => "game does not exist",
+        0x2b => "game is full",
+        0x2c => "you do not meet the level requirement",
+        0x6f => "a dead hardcore character cannot join",
+        0x71 => "a non-hardcore character cannot join",
+        0x73 => "unable to join (LoD game from a Classic client)",
+        else => "failed (unknown)",
+    };
+}
+
 var rxbuf: [16384]u8 = undefined;
 var rxlen: usize = 0;
 
@@ -695,8 +722,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // reply: u16 reqid, u16 token, u16 unk, u32 result
             const cg_token = if (cgr.len >= 4) std.mem.readInt(u16, cgr[2..4], .little) else 0;
             const cg_result = if (cgr.len >= 10) std.mem.readInt(u32, cgr[6..10], .little) else 0xffffffff;
-            _ = cg_token;
-            std.debug.print("[MCP_CREATEGAME] \"{s}\" result=0x{x}  => {s}\n", .{ gname, cg_result, if (cg_result == 0) "created" else "failed (no GS available?)" });
+            std.debug.print("[MCP_CREATEGAME] \"{s}\" token=0x{x} result=0x{x}  => {s}\n", .{ gname, cg_token, cg_result, createGameMeaning(cg_result) });
             if (cg_result != 0) return;
 
             // MCP_JOINGAME (0x04): reqid, name, pass
@@ -721,7 +747,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const jresult = std.mem.readInt(u32, jgr[14..18], .little);
             var gsipbuf: [20]u8 = undefined;
             const gsips = std.fmt.bufPrint(&gsipbuf, "{d}.{d}.{d}.{d}", .{ gsip[0], gsip[1], gsip[2], gsip[3] }) catch return;
-            std.debug.print("[MCP_JOINGAME] token=0x{x} gs={s}:{d} hash=0x{x} result=0x{x}\n", .{ gtoken, gsips, gs_port, ghash, jresult });
+            std.debug.print("[MCP_JOINGAME] token=0x{x} gs={s}:{d} hash=0x{x} result=0x{x}  => {s}\n", .{ gtoken, gsips, gs_port, ghash, jresult, joinGameMeaning(jresult) });
             if (jresult != 0) return;
 
             // Connect to the GS game port (qqserver) and play the entry sequence.
