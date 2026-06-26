@@ -33,7 +33,7 @@ jobs:
         run: |
           d="clientless-${{ matrix.name }}"
           mkdir -p "$d"
-          cp zig-out/bin/clientless zig-out/bin/bnftp README.md "$d"/
+          cp zig-out/bin/clientless README.md "$d"/
           tar -czf "$d.tar.gz" "$d"
       - uses: actions/upload-artifact@v4
         with:

@@ -264,7 +264,9 @@ fn recvUntil(fd: Socket, buf: []u8, want: u8) !Pkt {
     }
 }
 
-pub fn main(init: std.process.Init.Minimal) !void {
+// Entry point for the `bnftp` subcommand of the clientless binary (dispatched by
+// main.zig). init.args = [clientless, "bnftp", <bnftp args...>].
+pub fn run(init: std.process.Init.Minimal) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
@@ -282,7 +284,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var npos: usize = 0;
 
     var it = std.process.Args.Iterator.init(init.args);
-    _ = it.next(); // argv[0]
+    _ = it.next(); // argv[0] (clientless)
+    _ = it.next(); // "bnftp" subcommand
     while (it.next()) |a| {
         if (std.mem.eql(u8, a, "--socks5")) {
             const hp = it.next() orelse return err("--socks5 wants HOST:PORT");

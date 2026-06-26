@@ -21,6 +21,5 @@ RUN set -eux; \
 
 FROM scratch
 COPY --from=build /src/zig-out/bin/clientless /clientless
-COPY --from=build /src/zig-out/bin/bnftp /bnftp
-# Default to the BNCS/MCP/game client; override with `--entrypoint /bnftp` for BNFTP.
+# One binary: BNCS/MCP/game by default; `clientless bnftp ...` for the BNFTP file client.
 ENTRYPOINT ["/clientless"]

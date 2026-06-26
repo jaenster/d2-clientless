@@ -20,6 +20,7 @@ const core = @import("checkrev_core");
 const cdkey = @import("cdkey");
 const xsha1 = @import("xsha1");
 const huffman = @import("huffman.zig");
+const bnftp = @import("bnftp");
 
 // ── libc sockets (native host target; std.net/std.posix wrappers are gone in 0.16) ──
 const Socket = c_int;
@@ -385,6 +386,15 @@ fn lower(s: []const u8, buf: []u8) []const u8 {
 pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = std.heap.page_allocator;
 
+    // `clientless bnftp <args>` -> hand off to the BNFTP file client subcommand.
+    {
+        var peek = std.process.Args.Iterator.init(init.args);
+        _ = peek.next(); // argv[0]
+        if (peek.next()) |sub| {
+            if (std.mem.eql(u8, sub, "bnftp")) return bnftp.run(init);
+        }
+    }
+
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
     var host: ?[]const u8 = null;
@@ -403,6 +413,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var gs_port: u16 = 4000; // GS game port (qqserver public port)
     var ver_byte: u8 = 0x0e; // GAMELOGON nVerByte — GET_GameVersion() returns 0xe (14) for 1.14d
     var bnet_port: u16 = 6112; // BNCS port to connect to (--port)
+    var force_checkrev = false; // --force-checkrev: respond even if the MPQ isn't the one we implement
     var pos: usize = 0;
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--sig0")) {
@@ -433,6 +444,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             bnet_port = std.fmt.parseInt(u16, args.next() orelse "6112", 10) catch 6112;
         } else if (std.mem.eql(u8, a, "--delay")) {
             step_delay_ms = std.fmt.parseInt(u64, args.next() orelse "0", 10) catch 0;
+        } else if (std.mem.eql(u8, a, "--force-checkrev")) {
+            force_checkrev = true;
         } else if (std.mem.eql(u8, a, "--verbose")) {
             verbose = true;
         } else if (!std.mem.startsWith(u8, a, "--")) {
@@ -447,23 +460,50 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     const h = host orelse {
         std.debug.print(
-            \\usage: clientless <host> [product] [version] [options]
+            \\clientless — a pure-Zig Diablo II 1.14d Battle.net client (no game binary)
             \\
-            \\  product            D2DV | D2XP (default D2XP)
-            \\  version            e.g. 1.14.3.71
-            \\  --port <n>         BNCS port (default 6112)
-            \\  --keys K1[,K2]     26-char CD-keys (omit for a permissive realm)
-            \\  --login acct:pass  log in to an existing account
-            \\  --create acct:pass create the account, then log in
-            \\  --game <name>      create + join the game and enter it on the GS
-            \\  --gs-port <n>      GS game port (default 4000)
-            \\  --channel <name>   chat channel to join (default "Diablo II")
-            \\  --say <text>       send a chat message
-            \\  --kick <user>      /kick a user (channel operator)
-            \\  --listen <sec>     stay in chat reading events for N seconds
-            \\  --sig0             report sigOk=0 in CheckRevision
-            \\  --delay <ms>       pause before each step (gentler pacing; e.g. 500)
-            \\  --verbose          hexdump all BNCS + MCP traffic
+            \\usage:
+            \\  clientless <host> [product] [version] [options]   BNCS / MCP / chat / game
+            \\  clientless bnftp [options] <host> [product] [file]  BNFTP file client
+            \\
+            \\  product              D2DV (classic) | D2XP (expansion, default)
+            \\  version              client version string (default 1.14.3.71)
+            \\
+            \\auth:
+            \\  --keys K1[,K2]       26-char CD-key(s); omit on a permissive realm
+            \\  --login acct:pass    log in to an existing account
+            \\  --create acct:pass   create the account, then log in
+            \\  --force-checkrev     respond even if the version-check MPQ isn't CheckRevision.mpq
+            \\  --sig0               report sigOk=0 in CheckRevision
+            \\
+            \\game / chat:
+            \\  --game <name>        create + join the game and enter it on the GS
+            \\  --gs-port <n>        GS game port (default 4000)
+            \\  --channel <name>     chat channel to join (default "Diablo II")
+            \\  --say <text>         send a chat message after entering chat
+            \\  --kick <user>        /kick a user (needs channel-operator)
+            \\  --listen <sec>       stay in chat reading events for N seconds
+            \\
+            \\connection / debug:
+            \\  --port <n>           BNCS port (default 6112)
+            \\  --verbyte <n>        GAMELOGON version byte (default 14 = 1.14d)
+            \\  --delay <ms>         pause before each step (gentler pacing; e.g. 500)
+            \\  --verbose            hexdump all BNCS + MCP traffic + GS packets
+            \\
+            \\examples:
+            \\  # version check only (no keys/account)
+            \\  clientless useast.battle.net
+            \\  # full session on your own realm: create char, chat, ladder
+            \\  clientless realm.example.com D2XP 1.14.3.71 --login me:pw --listen 20
+            \\  # create the account first, then create + enter a game
+            \\  clientless realm.example.com D2XP 1.14.3.71 --create me:pw --game MyGame
+            \\  # two clients chatting (op kicks the other)
+            \\  clientless realm.example.com --login op:pw --channel ops --kick rude
+            \\  # live Battle.net with real CD-keys (your account, your risk)
+            \\  clientless useast.battle.net D2XP 1.14.3.71 --keys K1,K2 --login acct:pw --game MyGame
+            \\  # BNFTP: fetch a file's size, then download it
+            \\  clientless bnftp --head useast.battle.net D2XP CheckRevision.mpq
+            \\  clientless bnftp --out-dir . useast.battle.net D2XP CheckRevision.mpq
             \\
         , .{});
         return;
@@ -509,6 +549,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
         exe_info = "";
         std.debug.print("[checkrev] CLASSIC challenge -> placeholder exeHash=0x{x:0>8} (permissive realm)\n", .{exe_hash});
     } else {
+        // Our checkrev_core implements the 1.14d CheckRevision.mpq algorithm specifically.
+        // A different MPQ means a different hashing routine we don't replicate, so our
+        // response would be wrong — bail rather than send a bogus AUTH_CHECK (which could
+        // flag the account). --force-checkrev sends it anyway (e.g. probing a new server).
+        const EXPECTED_MPQ = "CheckRevision.mpq";
+        if (!std.mem.eql(u8, mpq, EXPECTED_MPQ)) {
+            std.debug.print("[checkrev] UNEXPECTED MPQ \"{s}\" — we only implement \"{s}\". " ++
+                "Not sending a (likely wrong) response. Use --force-checkrev to override.\n", .{ mpq, EXPECTED_MPQ });
+            if (!force_checkrev) return error.UnexpectedCheckRevisionMPQ;
+        }
         // modern split: first 4 base64 bytes -> EXE Hash (u32 LE); rest -> EXE Info string
         const full = core.response(challenge, game_ver, sig_ok, &full_buf) orelse return error.ShortChallenge;
         exe_hash = std.mem.readInt(u32, full[0..4], .little);
