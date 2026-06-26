@@ -57,9 +57,13 @@ it runs against real Battle.net too (it was validated end-to-end against a live 
 
 ## Install
 
-Prebuilt native binaries are on the [Releases](https://github.com/jaenster/d2-clientless/releases)
-page for **Linux** (x86_64, aarch64, armv7, riscv64), **macOS** (x86_64, aarch64), and **FreeBSD**
-(x86_64, aarch64). Linux builds are static musl (no dependencies). Or run the [container](#container).
+One line (Linux / macOS / FreeBSD) — detects your OS/arch, grabs the latest release binary:
+
+    curl -fsSL https://raw.githubusercontent.com/jaenster/d2-clientless/main/install.sh | sh
+
+Or grab a tarball yourself from the [Releases](https://github.com/jaenster/d2-clientless/releases)
+page — **Linux** (x86_64, aarch64, armv7, riscv64, static musl), **macOS** (x86_64, aarch64), and
+**FreeBSD** (x86_64, aarch64). Or run the [container](#container).
 
 ## Build
 
