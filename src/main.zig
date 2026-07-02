@@ -21,6 +21,8 @@ const cdkey = @import("cdkey");
 const xsha1 = @import("xsha1");
 const huffman = @import("huffman.zig");
 const bnftp = @import("bnftp");
+const packets = @import("game/packets.zig");
+const world_mod = @import("game/world.zig");
 
 // ── libc sockets (native host target; std.net/std.posix wrappers are gone in 0.16) ──
 const Socket = c_int;
@@ -29,6 +31,8 @@ extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
 extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
 extern "c" fn close(fd: c_int) c_int;
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int; // variadic: mode only used with O_CREAT
+extern "c" fn getentropy(buf: *anyopaque, n: usize) c_int; // CSPRNG seed (<=256B; macOS+glibc+musl)
 extern "c" fn setsockopt(fd: c_int, level: c_int, optname: c_int, optval: *const anyopaque, optlen: c_uint) c_int;
 const SOCK_STREAM: c_int = 1;
 
@@ -62,6 +66,45 @@ fn writeAll(fd: Socket, buf: []const u8) !void {
         sent += @intCast(n);
     }
 }
+
+// Blizzard's live game farm (e.g. 158.115.201.x) also listens on :443, speaking the
+// SAME D2GS protocol wrapped in TLS — the server greets unprompted (inside TLS) with
+// 0xAF00 (NEGOTIATE_COMPRESSION). That 443 listener is NOT behind the per-IP firewall
+// the d2cs JOINGAME whitelists for :4000, so it's an alternate game-entry transport.
+// GsConn abstracts the GS leg so the join loop is identical over plaintext or TLS.
+// The farm's cert is a real DigiCert wildcard *.diablo2.blizzard.com (O=Blizzard). A wildcard
+// matches exactly ONE label, so the SNI must be e.g. <region>.diablo2.blizzard.com (the bare
+// apex fails hostname matching). The subdomain very likely selects the region/backend.
+const GsSni = "asia.diablo2.blizzard.com";
+const GsConn = struct {
+    fd: Socket,
+    tls: ?*std.crypto.tls.Client = null,
+
+    // Read available bytes (decrypted, for TLS). Returns >0 = bytes, 0 = EOF, <0 = idle/timeout.
+    fn rd(self: *GsConn, buf: []u8) isize {
+        if (self.tls) |c| {
+            if (c.reader.buffered().len == 0) {
+                c.reader.fillMore() catch |e| return if (e == error.EndOfStream) 0 else -1;
+            }
+            const avail = c.reader.buffered();
+            if (avail.len == 0) return -1; // fill made no progress (timeout tick) — not EOF
+            const m = @min(buf.len, avail.len);
+            @memcpy(buf[0..m], avail[0..m]);
+            c.reader.toss(m);
+            return @intCast(m);
+        }
+        return read(self.fd, buf.ptr, buf.len);
+    }
+
+    fn wr(self: *GsConn, bytes: []const u8) !void {
+        if (self.tls) |c| {
+            try c.writer.writeAll(bytes);
+            try c.writer.flush();
+            return;
+        }
+        try writeAll(self.fd, bytes);
+    }
+};
 fn connectResolved(gpa: std.mem.Allocator, host: []const u8, port: u16) !Socket {
     const chost = try gpa.dupeZ(u8, host);
     var pbuf: [8]u8 = undefined;
@@ -84,6 +127,116 @@ fn connectResolved(gpa: std.mem.Allocator, host: []const u8, port: u16) !Socket 
         _ = close(fd);
     }
     return error.ConnectFailed;
+}
+
+// Self-contained D2GS GAMELOGON probe against one (TLS) endpoint. Used by --gs-brute to fire a
+// game's token/hash at MANY :443 gateways and see if any actually streams the game back. Returns
+// what came back AFTER GAMELOGON so the caller can tell "routed our game" from "silently ignored".
+const ProbeResult = struct {
+    connected: bool = false,
+    handshook: bool = false, // TLS ok (if tls) — got past the handshake
+    af_greeted: bool = false, // saw the 0xAF D2GS greeting
+    post_logon_bytes: usize = 0, // bytes received after we sent GAMELOGON
+    saw_gameflags: bool = false, // 0x01
+    saw_loadsuccess: bool = false, // 0x02
+};
+fn probeGateway(
+    gpa: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    use_tls: bool,
+    sni: []const u8,
+    ghash: u32,
+    gtoken: u16,
+    char_class: u8,
+    ver_byte: u32,
+    charname: []const u8,
+    read_ms: i64,
+) ProbeResult {
+    var r: ProbeResult = .{};
+    const fd = connectResolved(gpa, host, port) catch return r;
+    defer _ = close(fd);
+    r.connected = true;
+    setRecvTimeout(fd, 4000);
+
+    var threaded: std.Io.Threaded = undefined;
+    var trbuf: [20480]u8 = undefined;
+    var twbuf: [20480]u8 = undefined;
+    var tcr: [20480]u8 = undefined;
+    var tcw: [20480]u8 = undefined;
+    var freader: std.Io.File.Reader = undefined;
+    var fwriter: std.Io.File.Writer = undefined;
+    var client: std.crypto.tls.Client = undefined;
+    var conn: GsConn = .{ .fd = fd };
+    if (use_tls) {
+        threaded = std.Io.Threaded.init(gpa, .{});
+        const tio = threaded.io();
+        const f = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+        freader = f.readerStreaming(tio, &trbuf);
+        fwriter = f.writerStreaming(tio, &twbuf);
+        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+        if (getentropy(&entropy, entropy.len) != 0) return r;
+        client = std.crypto.tls.Client.init(&freader.interface, &fwriter.interface, .{
+            .host = .{ .explicit = sni },
+            .ca = .no_verification,
+            .read_buffer = &tcr,
+            .write_buffer = &tcw,
+            .entropy = &entropy,
+            .realtime_now = .{ .nanoseconds = @as(i96, nowMs()) * 1_000_000 },
+        }) catch return r;
+        conn.tls = &client;
+    }
+    defer if (use_tls) threaded.deinit();
+    r.handshook = true;
+
+    var sbuf: [16384]u8 = undefined;
+    var slen: usize = 0;
+
+    // wait for the 0xAF greeting (up to ~3s)
+    const hs_deadline = nowMs() + 3000;
+    while (nowMs() < hs_deadline) {
+        if (slen >= 2 and sbuf[0] == 0xAF) {
+            r.af_greeted = true;
+            std.mem.copyForwards(u8, sbuf[0 .. slen - 2], sbuf[2..slen]);
+            slen -= 2;
+            break;
+        }
+        const nr = conn.rd(sbuf[slen..]);
+        if (nr == 0) break;
+        if (nr < 0) continue;
+        slen += @intCast(nr);
+    }
+
+    // GAMELOGON (0x68), 37 bytes — identical layout to the main path
+    var gl: [37]u8 = [_]u8{0} ** 37;
+    gl[0] = 0x68;
+    std.mem.writeInt(u32, gl[1..5], ghash, .little);
+    std.mem.writeInt(u16, gl[5..7], gtoken, .little);
+    gl[7] = char_class;
+    std.mem.writeInt(u32, gl[8..12], ver_byte, .little);
+    std.mem.writeInt(u32, gl[12..16], 0xed5fcc50, .little);
+    std.mem.writeInt(u32, gl[16..20], 0x91a519b6, .little);
+    gl[20] = 0;
+    @memcpy(gl[21..][0..@min(charname.len, 16)], charname[0..@min(charname.len, 16)]);
+    conn.wr(&gl) catch return r;
+
+    // read whatever comes back for read_ms; count bytes + flag 0x01/0x02
+    slen = 0;
+    const deadline = nowMs() + read_ms;
+    while (nowMs() < deadline) {
+        const nr = conn.rd(sbuf[slen..]);
+        if (nr == 0) break;
+        if (nr < 0) continue;
+        const n: usize = @intCast(nr);
+        for (sbuf[slen .. slen + n]) |b| {
+            if (b == 0x01) r.saw_gameflags = true;
+            if (b == 0x02) r.saw_loadsuccess = true;
+        }
+        r.post_logon_bytes += n;
+        slen += n;
+        if (slen > sbuf.len - 2048) slen = 0; // we only care about counts/flags, recycle
+    }
+    return r;
 }
 
 const SID_AUTH_INFO = 0x50;
@@ -139,58 +292,8 @@ fn joinGameMeaning(r: u32) []const u8 {
     };
 }
 
-// D2GS server->client packet sizes, opcode 0x00..0xB4 — verbatim from the engine's
-// NET_D2GS_CLIENT_INCOMING_SIZE table @0x730ae8. >0 = fixed wire size; 0 = invalid;
-// -1 = variable (size derived from header fields, see scPacketSize). The game stream is
-// opcode-framed (NOT length-prefixed): [opcode][payload]. 0xAE is the compressed blob.
-const D2GS_SC_SIZE = [_]i16{
-    1,  8,  1,  12, 1,  1,  1,  6,  6,  11, 6,  6,  9,  13, 12, 16, // 0x00
-    16, 8,  26, 14, 18, 11, -1, 0,  15, 2,  2,  3,  5,  3,  4,  6, // 0x10
-    10, 12, 12, 13, 90, 90, -1, 40, 103, 97, 15, 0,  8,  0,  0,  0, // 0x20
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  -1, 8, // 0x30
-    13, 0,  6,  0,  0,  13, 0,  11, 11, 0,  0,  0,  16, 17, 7,  1, // 0x40
-    15, 14, 42, 10, 3,  0,  0,  14, 7,  26, 40, -1, 5,  6,  38, 5, // 0x50
-    7,  2,  7,  21, 0,  7,  7,  16, 21, 12, 12, 16, 16, 10, 1,  1, // 0x60
-    1,  1,  1,  32, 10, 13, 6,  2,  21, 6,  13, 8,  6,  18, 5,  10, // 0x70
-    0,  20, 29, 0,  0,  0,  0,  0,  0,  2,  6,  6,  11, 7,  10, 33, // 0x80
-    13, 26, 6,  8,  -1, 13, 9,  1,  7,  16, 17, 7,  -1, -1, 7,  8, // 0x90
-    10, 7,  8,  24, 3,  8,  -1, 7,  -1, 7,  -1, 7,  -1, 0,  -1, -1, // 0xA0
-    1,  0,  53, -1, 5, // 0xB0..0xB4
-};
-
-// Full wire size of the S->C packet at the front of `buf`, or null if the complete
-// packet isn't present yet (need more bytes). 0 return = invalid opcode (desync).
-fn scPacketSize(buf: []const u8) ?usize {
-    if (buf.len == 0) return null;
-    const op = buf[0];
-    if (op > 0xb4) return 0; // invalid
-    const t = D2GS_SC_SIZE[op];
-    if (t == 0) return 0; // unknown/invalid opcode
-    if (t > 0) { // fixed size
-        const n: usize = @intCast(t);
-        return if (buf.len >= n) n else null;
-    }
-    // variable-length: derive from header fields (engine GetIncomingPacketSize switch)
-    const sz: ?usize = switch (op) {
-        0x16, 0x5b => if (buf.len > 2) @as(usize, std.mem.readInt(u16, buf[1..3], .little)) else null,
-        0x3e => if (buf.len > 1) @as(usize, buf[1]) else null,
-        0x94 => if (buf.len > 1) (@as(usize, buf[1]) + 2) * 3 else null,
-        0x9c, 0x9d => if (buf.len > 2) @as(usize, buf[2]) else null,
-        0xa6 => if (buf.len > 3) @as(usize, std.mem.readInt(u16, buf[2..4], .little)) else null,
-        0xa8, 0xaa => if (buf.len > 6) @as(usize, buf[6]) else null,
-        0xac => if (buf.len > 0xc) @as(usize, buf[0xc]) else null,
-        0xae => if (buf.len > 2) blk: { // compressed blob
-            var raw = std.mem.readInt(u16, buf[1..3], .little);
-            if (raw > 0x1fd) raw = 0;
-            break :blk @as(usize, raw) + 3;
-        } else null,
-        0xaf => if (buf.len > 1) (if (buf[1] == 0) @as(usize, 2) else @as(usize, buf[1]) + 1) else null,
-        0xb3 => if (buf.len > 7) @as(usize, buf[1]) + 7 else null,
-        else => return 0, // 0x26 SSTR-string packet — not expected pre-entry; treat as desync
-    };
-    const need = sz orelse return null;
-    return if (buf.len >= need) need else null;
-}
+// S->C packet framing (size table + variable-length derivation) lives in game/packets.zig.
+const scPacketSize = packets.packetSize;
 
 var rxbuf: [16384]u8 = undefined;
 var rxlen: usize = 0;
@@ -383,6 +486,125 @@ fn lower(s: []const u8, buf: []u8) []const u8 {
     return buf[0..s.len];
 }
 
+fn hexVal(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+// `clientless replay <file>` — decode a captured S->C stream offline (no server). The file may
+// be raw bytes or a hexdump ("ae 12 00 ..." / "0xAE,0x12" / one long hex blob). Everything runs
+// through the same framing + world model as a live join, then prints a world snapshot.
+fn replay(gpa: std.mem.Allocator, path_opt: ?[]const u8) !void {
+    const path = path_opt orelse {
+        std.debug.print("usage: clientless replay <capture-file>\n", .{});
+        return;
+    };
+    var pathz: [4096]u8 = undefined;
+    if (path.len >= pathz.len) {
+        std.debug.print("replay: path too long\n", .{});
+        return;
+    }
+    @memcpy(pathz[0..path.len], path);
+    pathz[path.len] = 0;
+    const fd = open(@ptrCast(&pathz), 0); // O_RDONLY
+    if (fd < 0) {
+        std.debug.print("replay: cannot open {s}\n", .{path});
+        return;
+    }
+    defer _ = close(fd);
+    const cap: usize = 32 << 20;
+    const data = try gpa.alloc(u8, cap);
+    defer gpa.free(data);
+    var total: usize = 0;
+    while (total < cap) {
+        const r = read(fd, data[total..].ptr, cap - total);
+        if (r <= 0) break;
+        total += @intCast(r);
+    }
+    const contents = data[0..total];
+
+    // Heuristic: pure hex/whitespace text -> parse as a hexdump; otherwise treat as raw bytes.
+    var looks_hex = contents.len > 0;
+    for (contents) |b| {
+        if (hexVal(b) == null and b != ' ' and b != '\t' and b != '\n' and b != '\r' and b != ':' and b != ',' and b != 'x' and b != 'X') {
+            looks_hex = false;
+            break;
+        }
+    }
+
+    var bytes: []const u8 = contents;
+    var decoded: []u8 = &[_]u8{};
+    if (looks_hex) {
+        decoded = try gpa.alloc(u8, contents.len / 2 + 1);
+        var n: usize = 0;
+        var hi: ?u8 = null;
+        for (contents) |c| {
+            const v = hexVal(c);
+            if (v) |lo| {
+                if (hi) |h| {
+                    decoded[n] = (h << 4) | lo;
+                    n += 1;
+                    hi = null;
+                } else hi = lo;
+            } else hi = null; // any separator (incl. the 'x' in 0x) resets the nibble pair
+        }
+        bytes = decoded[0..n];
+    }
+    defer if (decoded.len > 0) gpa.free(decoded);
+
+    std.debug.print("replay: {s} ({d} bytes {s})\n", .{ path, bytes.len, if (looks_hex) "from hex" else "raw" });
+    var world = world_mod.World.init(gpa);
+    world.verbose = true;
+    defer world.deinit();
+    const count = feedStream(&world, bytes, true);
+    std.debug.print("\nreplayed {d} packets\n", .{count});
+    world.dumpSummary();
+}
+
+// Frame a COMPLETE buffer of S->C bytes and apply every packet, decompressing 0xAE containers.
+// Shares the framing rules with the live GS loop; used by `replay`. Returns the packet count.
+fn feedStream(world: *world_mod.World, bytes: []const u8, log: bool) usize {
+    var off: usize = 0;
+    var count: usize = 0;
+    while (off < bytes.len) {
+        const n = scPacketSize(bytes[off..]) orelse break; // truncated tail
+        if (n == 0) { // invalid opcode -> resync a byte
+            off += 1;
+            continue;
+        }
+        const id = bytes[off];
+        if (log) {
+            var nb: [8]u8 = undefined;
+            std.debug.print("<- {s} 0x{x:0>2} ({d} bytes)\n", .{ packets.label(id, &nb), id, n });
+        }
+        if (id == 0xAE and n > 3) {
+            var dbuf: [16384]u8 = undefined;
+            if (huffman.decompress(bytes[off + 3 .. off + n], &dbuf)) |dlen| {
+                var io: usize = 0;
+                while (io < dlen) {
+                    const isz = scPacketSize(dbuf[io..dlen]) orelse break;
+                    if (isz == 0) break;
+                    if (log) {
+                        var inb: [8]u8 = undefined;
+                        std.debug.print("  [inner] {s} 0x{x:0>2} ({d} bytes)\n", .{ packets.label(dbuf[io], &inb), dbuf[io], isz });
+                    }
+                    world.apply(dbuf[io .. io + isz]);
+                    io += isz;
+                }
+            }
+        } else {
+            world.apply(bytes[off .. off + n]);
+        }
+        count += 1;
+        off += n;
+    }
+    return count;
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = std.heap.page_allocator;
 
@@ -392,6 +614,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         _ = peek.next(); // argv[0]
         if (peek.next()) |sub| {
             if (std.mem.eql(u8, sub, "bnftp")) return bnftp.run(init);
+            if (std.mem.eql(u8, sub, "replay")) return replay(gpa, peek.next());
         }
     }
 
@@ -411,6 +634,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var delay_sec: u32 = 0; // wait N seconds after joining before say/kick (2-client ordering)
     var game_arg: ?[]const u8 = null; // --game <name>: create+join the game and enter it on the GS
     var gs_port: u16 = 4000; // GS game port (qqserver public port)
+    var gs_tls = false; // --gs-tls: wrap the GS leg in TLS (Blizzard's :443 D2GS-over-TLS farm)
+    var gs_host: ?[]const u8 = null; // --gs-host: override the GS IP (still use JOINGAME token/hash)
+    var gs_sni: []const u8 = GsSni; // --gs-sni: TLS SNI / cert hostname for the GS leg
+    var gs_gw = false; // --gs-gw: TLS to the PAIRED gateway IP (backend a.b.C.d -> a.b.(C+1).d)
+    var gs_pin: ?[]const u8 = null; // --gs-pin: only proceed if the GS IP's last octet is in this list
+    var gs_brute: ?[]const u8 = null; // --gs-brute: fire this game's token at every 201.<oct>:443 gateway
+    var gs_emit = false; // --emit-join: print JOINEMIT token/hash line and exit (for external bruteforce)
     var ver_byte: u8 = 0x0e; // GAMELOGON nVerByte — GET_GameVersion() returns 0xe (14) for 1.14d
     var bnet_port: u16 = 6112; // BNCS port to connect to (--port)
     var force_checkrev = false; // --force-checkrev: respond even if the MPQ isn't the one we implement
@@ -438,6 +668,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
             game_arg = args.next();
         } else if (std.mem.eql(u8, a, "--gs-port")) {
             gs_port = std.fmt.parseInt(u16, args.next() orelse "4000", 10) catch 4000;
+        } else if (std.mem.eql(u8, a, "--gs-tls")) {
+            gs_tls = true;
+            if (gs_port == 4000) gs_port = 443; // sensible default: TLS farm listens on 443
+        } else if (std.mem.eql(u8, a, "--gs-host")) {
+            gs_host = args.next();
+        } else if (std.mem.eql(u8, a, "--gs-sni")) {
+            gs_sni = args.next() orelse gs_sni;
+        } else if (std.mem.eql(u8, a, "--gs-gw")) {
+            gs_gw = true;
+        } else if (std.mem.eql(u8, a, "--gs-pin")) {
+            gs_pin = args.next();
+        } else if (std.mem.eql(u8, a, "--gs-brute")) {
+            gs_brute = args.next();
+        } else if (std.mem.eql(u8, a, "--emit-join")) {
+            gs_emit = true;
         } else if (std.mem.eql(u8, a, "--verbyte")) {
             ver_byte = std.fmt.parseInt(u8, args.next() orelse "0", 10) catch 0;
         } else if (std.mem.eql(u8, a, "--port")) {
@@ -478,7 +723,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\
             \\game / chat:
             \\  --game <name>        create + join the game and enter it on the GS
-            \\  --gs-port <n>        GS game port (default 4000)
+            \\  --gs-port <n>        GS game port (default 4000; 443 when --gs-tls)
+            \\  --gs-tls             join the GS over TLS (Blizzard's :443 D2GS-over-TLS farm)
+            \\  --gs-host <ip>       override the GS IP (keep JOINGAME token/hash; e.g. a :443 gateway)
+            \\  --gs-sni <name>      TLS SNI/cert host for --gs-tls (default asia.diablo2.blizzard.com)
+            \\  --gs-gw              TLS to the paired gateway IP (backend a.b.C.d -> a.b.C+1.d)
+            \\  --gs-pin <octets>    only proceed if GS IP's last octet is in this comma list (else exit 2)
+            \\  --gs-brute <octets>  fire this game's token at every 201.<oct>:443 gateway; report routers
             \\  --channel <name>     chat channel to join (default "Diablo II")
             \\  --say <text>         send a chat message after entering chat
             \\  --kick <user>        /kick a user (needs channel-operator)
@@ -827,7 +1078,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const cg_token = if (cgr.len >= 4) std.mem.readInt(u16, cgr[2..4], .little) else 0;
             const cg_result = if (cgr.len >= 10) std.mem.readInt(u32, cgr[6..10], .little) else 0xffffffff;
             std.debug.print("[MCP_CREATEGAME] \"{s}\" token=0x{x} result=0x{x}  => {s}\n", .{ gname, cg_token, cg_result, createGameMeaning(cg_result) });
-            if (cg_result != 0) return;
+            // 0x1f = "game already exists" (e.g. left over from a prior run): fall through and
+            // JOIN it instead of bailing. Any other non-zero create result is fatal.
+            if (cg_result != 0 and cg_result != 0x1f) return;
+            if (cg_result == 0x1f) std.debug.print("[MCP_CREATEGAME] game exists -> joining it\n", .{});
 
             // MCP_JOINGAME (0x04): reqid, name, pass
             var jgb: [64]u8 = undefined;
@@ -854,19 +1108,148 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("[MCP_JOINGAME] token=0x{x} gs={s}:{d} hash=0x{x} result=0x{x}  => {s}\n", .{ gtoken, gsips, gs_port, ghash, jresult, joinGameMeaning(jresult) });
             if (jresult != 0) return;
 
-            // Connect to the GS game port (qqserver) and play the entry sequence.
-            const gsfd = connectResolved(gpa, gsips, gs_port) catch {
-                std.debug.print("[GS] connect to {s}:{d} failed\n", .{ gsips, gs_port });
+            // --emit-join: print a machine-readable line with the fresh token/hash and exit, so an
+            // external parallel bruteforcer can fire it at many gateways inside the token window.
+            if (gs_emit) {
+                std.debug.print("JOINEMIT gsip={s} token={d} hash={d} char={s} verbyte={d}\n", .{ gsips, gtoken, ghash, charname, ver_byte });
+                return;
+            }
+
+            // --gs-brute: fire THIS game's token/hash at every 158.115.201.<oct>:443 gateway and
+            // report which (if any) actually streams the game back — the definitive test of whether
+            // any TLS gateway routes a game our d2cs assigned to a :4000 backend.
+            if (gs_brute) |octets| {
+                var pre = std.mem.splitScalar(u8, gsips, '.');
+                const p0 = pre.next() orelse "158";
+                const p1 = pre.next() orelse "115";
+                std.debug.print("[brute] game on {s}, token=0x{x} hash=0x{x} — sweeping {s}.{s}.201.x:443\n", .{ gsips, gtoken, ghash, p0, p1 });
+                var any = false;
+                var oit = std.mem.splitScalar(u8, octets, ',');
+                while (oit.next()) |tok| {
+                    if (tok.len == 0) continue;
+                    var hb: [21]u8 = undefined;
+                    const ghost = std.fmt.bufPrint(&hb, "{s}.{s}.201.{s}", .{ p0, p1, tok }) catch continue;
+                    const res = probeGateway(gpa, ghost, 443, true, gs_sni, ghash, gtoken, 1, ver_byte, charname, 2000);
+                    if (res.post_logon_bytes > 0 or res.saw_loadsuccess) {
+                        any = true;
+                        std.debug.print("[brute] {s}:443  *** ROUTED *** af={} post-logon={d}B gameflags={} loadsuccess={}\n", .{ ghost, res.af_greeted, res.post_logon_bytes, res.saw_gameflags, res.saw_loadsuccess });
+                    } else if (res.handshook) {
+                        std.debug.print("[brute] {s}:443  tls-ok af={} but SILENT after GAMELOGON\n", .{ ghost, res.af_greeted });
+                    } else if (res.connected) {
+                        std.debug.print("[brute] {s}:443  connected but TLS failed\n", .{ghost});
+                    } else {
+                        std.debug.print("[brute] {s}:443  no connect\n", .{ghost});
+                    }
+                }
+                std.debug.print("[brute] done — {s}\n", .{if (any) "at least one gateway ROUTED the game" else "NO gateway routed the game (TLS pool is separate from the :4000 backends)"});
+                return;
+            }
+
+            // Connect to the GS game port (qqserver) and play the entry sequence. --gs-host can
+            // redirect to an alternate endpoint (e.g. the :443 TLS gateway) while still using the
+            // token/hash this JOINGAME minted — to test whether that endpoint routes to our game.
+            // --gs-pin: only proceed if the GS landed on a backend whose paired gateway is open
+            // (the matched-octet set from scanning). Otherwise bail with code 2 so a shell loop
+            // can retry createGame until it lands on a host that actually has a :443 gateway.
+            if (gs_pin) |pinlist| {
+                var oit = std.mem.splitScalar(u8, gsips, '.');
+                _ = oit.next();
+                _ = oit.next();
+                _ = oit.next();
+                const last_oct = oit.next() orelse "";
+                var found = false;
+                var pit = std.mem.splitScalar(u8, pinlist, ',');
+                while (pit.next()) |tok| {
+                    if (std.mem.eql(u8, tok, last_oct)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    std.debug.print("[GS] landed on {s} (octet {s}) — no open gateway, skipping\n", .{ gsips, last_oct });
+                    std.process.exit(2);
+                }
+                std.debug.print("[GS] landed on {s} (octet {s}) — paired gateway is open, proceeding\n", .{ gsips, last_oct });
+            }
+
+            // --gs-gw: the GS backend a.b.C.d is fronted by a paired TLS gateway a.b.(C+1).d
+            // (same last octet, third octet +1 — e.g. 158.115.200.46 -> 158.115.201.46). The
+            // gateway routes our game by the JOINGAME token/hash to its paired backend.
+            var gwbuf: [21]u8 = undefined;
+            var gs_connect_host = gs_host orelse gsips;
+            if (gs_host == null and gs_gw) {
+                var it = std.mem.splitScalar(u8, gsips, '.');
+                const o0 = it.next() orelse "";
+                const o1 = it.next() orelse "";
+                const o2 = it.next() orelse "";
+                const o3 = it.next() orelse "";
+                const c = std.fmt.parseInt(u8, o2, 10) catch 255;
+                if (c < 255) {
+                    gs_connect_host = std.fmt.bufPrint(&gwbuf, "{s}.{s}.{d}.{s}", .{ o0, o1, c + 1, o3 }) catch gsips;
+                }
+            }
+            if (!std.mem.eql(u8, gs_connect_host, gsips))
+                std.debug.print("[GS] GS backend {s} -> gateway {s} (token/hash from JOINGAME)\n", .{ gsips, gs_connect_host });
+            const gsfd = connectResolved(gpa, gs_connect_host, gs_port) catch {
+                std.debug.print("[GS] connect to {s}:{d} failed\n", .{ gs_connect_host, gs_port });
                 return;
             };
             defer _ = close(gsfd);
-            setRecvTimeout(gsfd, 2000);
+            // TLS-mode reads block per-record; use a generous idle timeout so the timeout
+            // only fires when the stream is truly quiet (never mid-record during the burst).
+            setRecvTimeout(gsfd, if (gs_tls) 6000 else 2000);
+
+            // Optionally wrap the GS socket in TLS (Blizzard's :443 D2GS farm). BNCS/MCP above
+            // stayed plaintext; only this game leg is encrypted. The std TLS client drives the
+            // raw fd through std.Io.File reader/writer (no engine, no extra deps).
+            var threaded: std.Io.Threaded = undefined;
+            var tls_rbuf: [20480]u8 = undefined; // transport ciphertext in (>= tls min_buffer_len ~16640)
+            var tls_wbuf: [20480]u8 = undefined; // transport ciphertext out
+            var tls_cleartext_r: [20480]u8 = undefined; // decrypted plaintext (client.reader)
+            var tls_cleartext_w: [20480]u8 = undefined; // plaintext to encrypt (client.writer)
+            var tls_freader: std.Io.File.Reader = undefined;
+            var tls_fwriter: std.Io.File.Writer = undefined;
+            var tls_client: std.crypto.tls.Client = undefined;
+            var conn: GsConn = .{ .fd = gsfd };
+            if (gs_tls) {
+                threaded = std.Io.Threaded.init(gpa, .{});
+                const tio = threaded.io();
+                const gsfile = std.Io.File{ .handle = gsfd, .flags = .{ .nonblocking = false } };
+                tls_freader = gsfile.readerStreaming(tio, &tls_rbuf);
+                tls_fwriter = gsfile.writerStreaming(tio, &tls_wbuf);
+                var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+                if (getentropy(&entropy, entropy.len) != 0) {
+                    std.debug.print("[GS] getentropy failed\n", .{});
+                    return;
+                }
+                tls_client = std.crypto.tls.Client.init(&tls_freader.interface, &tls_fwriter.interface, .{
+                    .host = .{ .explicit = gs_sni }, // SNI — Blizzard's farm routes on it
+                    .ca = .no_verification, // mirror the proof's rejectUnauthorized:false
+                    .read_buffer = &tls_cleartext_r,
+                    .write_buffer = &tls_cleartext_w,
+                    .entropy = &entropy,
+                    .realtime_now = .{ .nanoseconds = @as(i96, nowMs()) * 1_000_000 },
+                }) catch |e| {
+                    std.debug.print("[GS] TLS handshake to {s}:{d} failed: {}\n", .{ gsips, gs_port, e });
+                    return;
+                };
+                conn.tls = &tls_client;
+                std.debug.print("[GS] TLS handshake OK (SNI {s}) — D2GS-over-TLS\n", .{gs_sni});
+            }
+            defer if (gs_tls) threaded.deinit();
+
             var sbuf: [32768]u8 = undefined;
             var slen: usize = 0;
             var handshook = false;
             var sent6b = false;
             var world_bytes: usize = 0;
             var pkt_count: usize = 0;
+
+            // World model rebuilt from the S->C stream (game/world.zig). Each framed packet is
+            // fed to world.apply; the 0xAE container's inner packets are fed individually.
+            var world = world_mod.World.init(gpa);
+            world.verbose = verbose;
+            defer world.deinit();
 
             // Real-client sequence: WAIT for the GS's 0xAF connection-established packet
             // (D2GS_Connected) BEFORE sending GAMELOGON. pfModes_EnterGame only sends 0x68
@@ -883,7 +1266,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         handshook = true;
                         break;
                     }
-                    const nr = read(gsfd, sbuf[slen..].ptr, sbuf.len - slen);
+                    const nr = conn.rd(sbuf[slen..]);
                     if (nr == 0) {
                         std.debug.print("[GS] closed before connection handshake\n", .{});
                         return;
@@ -907,12 +1290,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             gl[20] = 0; // nLanguageCode
             @memcpy(gl[21..][0..@min(charname.len, 16)], charname[0..@min(charname.len, 16)]); // szCharName[16]
             pace();
-            try writeAll(gsfd, &gl);
+            try conn.wr(&gl);
             std.debug.print("[GS] -> GAMELOGON (0x68) token=0x{x} char=\"{s}\"\n", .{ gtoken, charname });
             // Now read the S->C stream and send JOINGAME(0x6b) only on the server's 0x02
             // LoadSuccess (NET_D2GS_CLIENT_Incoming0x02_LoadSuccess @0x45c910). Length-prefixed
             // frames (1 byte <0xF0, else 2-byte [0xF0|hi][lo]); run the GS with --no-compress.
-            setRecvTimeout(gsfd, 1500);
+            setRecvTimeout(gsfd, if (gs_tls) 6000 else 1500);
             const deadline = nowMs() + 8000;
             while (nowMs() < deadline) {
                 var off: usize = 0;
@@ -924,9 +1307,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         continue;
                     }
                     const id = sbuf[off];
-                    const tag = if (id == 0xAE) " (compressed blob)" else "";
-                    std.debug.print("[GS] <- packet 0x{x:0>2} ({d} bytes){s}\n", .{ id, n, tag });
-                    rawDump(sbuf[off .. off + n]);
+                    var nb: [8]u8 = undefined;
+                    std.debug.print("[GS] <- {s} 0x{x:0>2} ({d} bytes)\n", .{ packets.label(id, &nb), id, n });
+                    if (verbose) rawDump(sbuf[off .. off + n]);
                     pkt_count += 1;
                     if (sent6b) world_bytes += n;
                     if (id == 0xAE and n > 3) { // compressed blob: huffman-decompress + parse inner
@@ -938,20 +1321,24 @@ pub fn main(init: std.process.Init.Minimal) !void {
                                 const isz = scPacketSize(dbuf[io..dlen]) orelse break;
                                 if (isz == 0) break;
                                 const iid = dbuf[io];
-                                std.debug.print("    [inner] 0x{x:0>2} ({d} bytes)\n", .{ iid, isz });
+                                var inb: [8]u8 = undefined;
+                                std.debug.print("    [inner] {s} 0x{x:0>2} ({d} bytes)\n", .{ packets.label(iid, &inb), iid, isz });
+                                world.apply(dbuf[io .. io + isz]);
                                 if (iid == 0x02 and !sent6b) {
                                     pace();
-                                    try writeAll(gsfd, &[_]u8{0x6b});
+                                    try conn.wr(&[_]u8{0x6b});
                                     sent6b = true;
                                     std.debug.print("[GS] -> JOINGAME (0x6b)  (0x02 inside compressed blob)\n", .{});
                                 }
                                 io += isz;
                             }
                         }
+                    } else {
+                        world.apply(sbuf[off .. off + n]);
                     }
                     if (id == 0x02 and !sent6b) { // raw LoadSuccess -> send JOINGAME, like the real client
                         pace();
-                        try writeAll(gsfd, &[_]u8{0x6b});
+                        try conn.wr(&[_]u8{0x6b});
                         sent6b = true;
                         std.debug.print("[GS] -> JOINGAME (0x6b)  (in response to 0x02 LoadSuccess)\n", .{});
                     }
@@ -961,7 +1348,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     std.mem.copyForwards(u8, sbuf[0 .. slen - off], sbuf[off..slen]);
                     slen -= off;
                 }
-                const nr = read(gsfd, sbuf[slen..].ptr, sbuf.len - slen);
+                const nr = conn.rd(sbuf[slen..]);
                 if (nr == 0) {
                     std.debug.print("[GS] connection closed by GS ({d} packets, sent6b={})\n", .{ pkt_count, sent6b });
                     return;
@@ -970,7 +1357,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 slen += @intCast(nr);
             }
             if (sent6b)
-                std.debug.print("[GS] joined: {d} packets, {d} world bytes after 0x6b  => IN GAME\n", .{ pkt_count, world_bytes })
+                std.debug.print("[GS] joined: {d} packets, {d} world bytes after 0x6b  => IN GAME\n" ++
+                    "[GS] world: act={d} level={d} mapSeed=0x{x:0>8} units={d}\n", .{ pkt_count, world_bytes, world.act, world.level_id, world.map_seed, world.unitCount() })
             else
                 std.debug.print("[GS] never saw 0x02 LoadSuccess ({d} packets) — 0x6b not sent\n", .{pkt_count});
             return;

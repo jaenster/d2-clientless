@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
     // ── crypto unit tests: standard SHA-1 (CheckRevision), WC3 26-char CD-key decode,
     //    Blizzard broken SHA-1 (OLS password) — each module carries its own `test`s. ──
     const test_step = b.step("test", "Run the crypto unit tests");
-    for ([_][]const u8{ "src/checkrev_core.zig", "src/cdkey.zig", "src/xsha1.zig" }) |path| {
+    for ([_][]const u8{ "src/checkrev_core.zig", "src/cdkey.zig", "src/xsha1.zig", "src/game/bitreader.zig", "src/game/itemstatcost.zig", "src/game/itemtypes.zig", "src/game/item.zig", "src/game/packets.zig", "src/game/world.zig" }) |path| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),
