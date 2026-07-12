@@ -1292,11 +1292,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
             pace();
             try conn.wr(&gl);
             std.debug.print("[GS] -> GAMELOGON (0x68) token=0x{x} char=\"{s}\"\n", .{ gtoken, charname });
-            // Now read the S->C stream and send JOINGAME(0x6b) only on the server's 0x02
-            // LoadSuccess (NET_D2GS_CLIENT_Incoming0x02_LoadSuccess @0x45c910). Length-prefixed
-            // frames (1 byte <0xF0, else 2-byte [0xF0|hi][lo]); run the GS with --no-compress.
+            // Read the S->C stream and send JOINGAME/ENTERGAME (0x6b). Two server dialects:
+            //   • REAL 1.14d engine: sends HandShake 0x0b (+ maybe ping 0x6a) FIRST and expects
+            //     the client to send 0x6b BEFORE it streams the world; LoadAct 0x03 / 0x02 come
+            //     AFTER. So we fire 0x6b on the first 0x0b HandShake.
+            //   • our STANDALONE GS: streams AF01+GameFlags then 0x02 LoadSuccess, and the client
+            //     sends 0x6b in response to 0x02. Kept as a fallback (below).
+            // Length-prefixed frames (1 byte <0xF0, else 2-byte [0xF0|hi][lo]); 0xAE = Huffman.
             setRecvTimeout(gsfd, if (gs_tls) 6000 else 1500);
-            const deadline = nowMs() + 8000;
+            var deadline = nowMs() + 8000;
             while (nowMs() < deadline) {
                 var off: usize = 0;
                 while (off < slen) {
@@ -1336,7 +1340,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     } else {
                         world.apply(sbuf[off .. off + n]);
                     }
-                    if (id == 0x02 and !sent6b) { // raw LoadSuccess -> send JOINGAME, like the real client
+                    // REAL engine: HandShake 0x0b arrives first and the engine waits for our 0x6b
+                    // before streaming the world. Fire ENTERGAME immediately on the HandShake.
+                    if (id == 0x0b and !sent6b) {
+                        pace();
+                        try conn.wr(&[_]u8{0x6b});
+                        sent6b = true;
+                        deadline = nowMs() + 12000; // give the world stream time after ENTERGAME
+                        std.debug.print("[GS] -> ENTERGAME (0x6b)  (after HandShake 0x0b — real engine)\n", .{});
+                    }
+                    if (id == 0x02 and !sent6b) { // raw LoadSuccess -> send JOINGAME (standalone GS fallback)
                         pace();
                         try conn.wr(&[_]u8{0x6b});
                         sent6b = true;
