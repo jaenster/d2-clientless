@@ -247,6 +247,78 @@ const SID_AUTH_INFO = 0x50;
 const SID_AUTH_CHECK = 0x51;
 const SID_PING = 0x25;
 
+/// Options for `fetch`. proto_ver is the BNFTP version dword (default 0x0100).
+/// bnftp_only is kept for parity with the CLI; fetch always uses a bare 0x02
+/// connection and never runs the AUTH_INFO handshake, so it is informational.
+pub const FetchOpts = struct {
+    proto_ver: u16 = 0x0100,
+    bnftp_only: bool = true,
+};
+
+/// Open a fresh BNFTP (0x02) connection to host:port, request `filename` for
+/// `product` (4CC, e.g. "D2XP"), read the whole reply, and return the file
+/// payload bytes. Caller frees with `gpa`. Returns an empty slice if the server
+/// reports the file as not hosted (fileSize == 0) or sends a short reply.
+pub fn fetch(
+    gpa: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    product: []const u8,
+    filename: []const u8,
+    opts: FetchOpts,
+) ![]u8 {
+    const fd = try dial(gpa, host, port, null);
+    defer _ = close(fd);
+
+    var req: [512]u8 = undefined;
+    var w: usize = 0;
+    w += 2; // [0x00] reqLen u16, filled below
+    std.mem.writeInt(u16, req[w..][0..2], opts.proto_ver, .little);
+    w += 2;
+    std.mem.writeInt(u32, req[w..][0..4], fourcc("IX86"), .little);
+    w += 4; // platform
+    std.mem.writeInt(u32, req[w..][0..4], fourcc(product), .little);
+    w += 4; // product
+    std.mem.writeInt(u32, req[w..][0..4], 0, .little);
+    w += 4; // bannerId
+    std.mem.writeInt(u32, req[w..][0..4], 0, .little);
+    w += 4; // bannerExt
+    std.mem.writeInt(u32, req[w..][0..4], 0, .little);
+    w += 4; // startPos
+    std.mem.writeInt(u64, req[w..][0..8], 0, .little);
+    w += 8; // local filetime
+    @memcpy(req[w..][0..filename.len], filename);
+    w += filename.len;
+    req[w] = 0;
+    w += 1; // cstr null
+    std.mem.writeInt(u16, req[0..2], @intCast(w), .little); // reqLen = whole header
+
+    try writeAll(fd, &[_]u8{0x02}); // BNFTP protocol selector
+    try writeAll(fd, req[0..w]);
+
+    // Read the whole reply (header + file) up to a cap (patches are ~10 MB).
+    const cap = 64 << 20;
+    const reply = try gpa.alloc(u8, cap);
+    defer gpa.free(reply);
+    var total: usize = 0;
+    while (total < cap) {
+        const n = readSome(fd, reply[total..]);
+        if (n == 0) break;
+        total += n;
+    }
+    const data = reply[0..total];
+    if (data.len < 8) return gpa.alloc(u8, 0);
+
+    const hlen = std.mem.readInt(u32, data[0..4], .little);
+    const fsize = std.mem.readInt(u32, data[4..8], .little);
+    if (fsize == 0 or hlen < 0x18 or hlen > data.len) return gpa.alloc(u8, 0);
+    const body = data[hlen..];
+    const n = @min(body.len, fsize);
+    const out = try gpa.alloc(u8, n);
+    @memcpy(out, body[0..n]);
+    return out;
+}
+
 /// Receive BNCS packets until one with id == want. Real bnet sends SID_PING
 /// (0x25) on connect — echo its cookie back (servers gate further replies on it)
 /// and keep reading. Unrelated packets are hexdumped and skipped.
@@ -424,6 +496,21 @@ pub fn run(init: std.process.Init.Minimal) !void {
     const file_to_get = filename orelse (if (mpq_name_len > 0) mpq_name_buf[0..mpq_name_len] else return err("no filename: AUTH_INFO gave none and none passed on cmdline"));
 
     // ── Step 2: BNFTP download (0x02 connection, unauthenticated) ──
+    // Common path (no proxy, full body): use the reusable fetch() helper.
+    if (proxy == null and !head_only) {
+        const body = try fetch(gpa, host, port, product, file_to_get, .{ .proto_ver = proto_ver });
+        std.debug.print("\n[2] BNFTP fetched \"{s}\": {d} file bytes\n", .{ file_to_get, body.len });
+        const out = if (out_dir) |d|
+            try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ d, basename(file_to_get) }, 0)
+        else
+            try std.fmt.allocPrintSentinel(gpa, "bnftp-{s}", .{basename(file_to_get)}, 0);
+        try writeFile(out.ptr, body);
+        std.debug.print("  saved {d} file bytes -> {s}\n", .{ body.len, out });
+        if (body.len >= 4) std.debug.print("  first 4 file bytes: {x:0>2} {x:0>2} {x:0>2} {x:0>2} (MPQ magic 'MPQ\\x1a' = 4d 50 51 1a)\n", .{ body[0], body[1], body[2], body[3] });
+        std.debug.print("\ndone.\n", .{});
+        return;
+    }
+
     {
         const fd = try dial(gpa, host, port, proxy);
         defer _ = close(fd);

@@ -30,6 +30,10 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addAnonymousImport("bnftp", .{ .root_source_file = b.path("src/bnftp.zig") });
     b.installArtifact(exe);
 
+    // Expose the BNFTP fetch logic as a public module so downstream packages can
+    // `@import("bnftp")` and call `bnftp.fetch(...)` (e.g. the re-fetch poller).
+    _ = b.addModule("bnftp", .{ .root_source_file = b.path("src/bnftp.zig") });
+
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);
