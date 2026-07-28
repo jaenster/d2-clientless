@@ -296,26 +296,37 @@ pub fn fetch(
     try writeAll(fd, &[_]u8{0x02}); // BNFTP protocol selector
     try writeAll(fd, req[0..w]);
 
-    // Read the whole reply (header + file) up to a cap (patches are ~10 MB).
+    // Read the reply (header + file) up to a cap (patches are ~10 MB). First get
+    // the 8-byte prefix (hlen, fsize), then read until the full declared reply is
+    // in hand. A short read - peer closed or the recv timeout elapsed mid-transfer
+    // - is a truncation ERROR, not a valid file: returning a partial file silently
+    // corrupts the archive (a truncated tos.txt looks like a fake divergence). The
+    // caller retries on error.
     const cap = 64 << 20;
     const reply = try gpa.alloc(u8, cap);
     defer gpa.free(reply);
     var total: usize = 0;
-    while (total < cap) {
+    while (total < 8) {
         const n = readSome(fd, reply[total..]);
         if (n == 0) break;
         total += n;
     }
-    const data = reply[0..total];
-    if (data.len < 8) return gpa.alloc(u8, 0);
+    if (total < 8) return gpa.alloc(u8, 0); // no header at all -> treat as not hosted
 
-    const hlen = std.mem.readInt(u32, data[0..4], .little);
-    const fsize = std.mem.readInt(u32, data[4..8], .little);
-    if (fsize == 0 or hlen < 0x18 or hlen > data.len) return gpa.alloc(u8, 0);
-    const body = data[hlen..];
-    const n = @min(body.len, fsize);
-    const out = try gpa.alloc(u8, n);
-    @memcpy(out, body[0..n]);
+    const hlen = std.mem.readInt(u32, reply[0..4], .little);
+    const fsize = std.mem.readInt(u32, reply[4..8], .little);
+    if (fsize == 0) return gpa.alloc(u8, 0); // server reports the file as not hosted
+    if (hlen < 0x18) return error.BnftpBadHeader;
+    const need: usize = @as(usize, hlen) + fsize;
+    if (need > cap) return error.BnftpReplyTooLarge;
+
+    while (total < need) {
+        const n = readSome(fd, reply[total..need]);
+        if (n == 0) return error.BnftpTruncated; // closed/timed out before the full file
+        total += n;
+    }
+    const out = try gpa.alloc(u8, fsize);
+    @memcpy(out, reply[hlen..need]);
     return out;
 }
 
