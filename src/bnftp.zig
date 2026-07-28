@@ -266,6 +266,9 @@ pub fn fetch(
     product: []const u8,
     filename: []const u8,
     opts: FetchOpts,
+    // Optional out: Blizzard's reported last-write time (Windows FILETIME, 100ns
+    // ticks since 1601), read from the reply header. Left untouched on a miss.
+    filetime_out: ?*u64,
 ) ![]u8 {
     const fd = try dial(gpa, host, port, null);
     defer _ = close(fd);
@@ -325,6 +328,9 @@ pub fn fetch(
         if (n == 0) return error.BnftpTruncated; // closed/timed out before the full file
         total += n;
     }
+    // Last-write time sits at header offset 0x10 (after headerLen, fileSize,
+    // bannerId, bannerExt); hlen >= 0x18 guarantees these 8 bytes are present.
+    if (filetime_out) |p| p.* = std.mem.readInt(u64, reply[0x10..0x18], .little);
     const out = try gpa.alloc(u8, fsize);
     @memcpy(out, reply[hlen..need]);
     return out;
@@ -509,8 +515,9 @@ pub fn run(init: std.process.Init.Minimal) !void {
     // ── Step 2: BNFTP download (0x02 connection, unauthenticated) ──
     // Common path (no proxy, full body): use the reusable fetch() helper.
     if (proxy == null and !head_only) {
-        const body = try fetch(gpa, host, port, product, file_to_get, .{ .proto_ver = proto_ver });
-        std.debug.print("\n[2] BNFTP fetched \"{s}\": {d} file bytes\n", .{ file_to_get, body.len });
+        var filetime: u64 = 0;
+        const body = try fetch(gpa, host, port, product, file_to_get, .{ .proto_ver = proto_ver }, &filetime);
+        std.debug.print("\n[2] BNFTP fetched \"{s}\": {d} file bytes (filetime={d})\n", .{ file_to_get, body.len, filetime });
         const out = if (out_dir) |d|
             try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ d, basename(file_to_get) }, 0)
         else
