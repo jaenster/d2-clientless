@@ -1,5 +1,7 @@
 # clientless
 
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/MHK2Dg9)
+
 A clientless Diablo II **1.14d** Battle.net client, written in Zig. It speaks the wire
 protocols directly — **BNCS** (login), **MCP** (realm/characters), **BNFTP** (file transfer),
 and the **D2GS** game protocol — with **no game binary, no wine, and no graphics**. One small
