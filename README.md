@@ -8,6 +8,8 @@ and the **D2GS** game protocol — with **no game binary, no wine, and no graphi
 static binary connects, authenticates, picks a realm, creates/selects a character, joins a
 game, and receives the live in-game packet stream.
 
+If this is useful to you, you can [sponsor the work](https://github.com/sponsors/jaenster).
+
 ## Why this exists
 
 This is the **test client for [jaenster/d2-dedicated-server](https://github.com/jaenster/d2-dedicated-server)**
