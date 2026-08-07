@@ -6,3 +6,5 @@
 .zig-cache/
 d2run-logs/
 zig-out/
+*.mpq
+realmd-data/
