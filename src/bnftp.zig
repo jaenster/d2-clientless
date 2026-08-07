@@ -247,12 +247,30 @@ const SID_AUTH_INFO = 0x50;
 const SID_AUTH_CHECK = 0x51;
 const SID_PING = 0x25;
 
+const SID_CHECKAD = 0x15;
+const SID_DISPLAYAD = 0x21;
+const SID_GETFILETIME = 0x33;
+
+extern "c" fn gettimeofday(tv: *std.posix.timeval, tz: ?*anyopaque) c_int;
+fn unixNow() u32 {
+    var tv: std.posix.timeval = undefined;
+    _ = gettimeofday(&tv, null);
+    return @intCast(tv.sec);
+}
+
 /// Options for `fetch`. proto_ver is the BNFTP version dword (default 0x0100).
 /// bnftp_only is kept for parity with the CLI; fetch always uses a bare 0x02
 /// connection and never runs the AUTH_INFO handshake, so it is informational.
+///
+/// banner_id / banner_ext address the *ad banner* store rather than the plain
+/// file store: with both non-zero the server resolves the ad by id+extension,
+/// which is a different key space from the filename (ad000001.smk by name is
+/// refused). banner_ext is the extension as a 4CC, e.g. fourcc("smk").
 pub const FetchOpts = struct {
     proto_ver: u16 = 0x0100,
     bnftp_only: bool = true,
+    banner_id: u32 = 0,
+    banner_ext: u32 = 0,
 };
 
 /// Open a fresh BNFTP (0x02) connection to host:port, request `filename` for
@@ -274,27 +292,7 @@ pub fn fetch(
     defer _ = close(fd);
 
     var req: [512]u8 = undefined;
-    var w: usize = 0;
-    w += 2; // [0x00] reqLen u16, filled below
-    std.mem.writeInt(u16, req[w..][0..2], opts.proto_ver, .little);
-    w += 2;
-    std.mem.writeInt(u32, req[w..][0..4], fourcc("IX86"), .little);
-    w += 4; // platform
-    std.mem.writeInt(u32, req[w..][0..4], fourcc(product), .little);
-    w += 4; // product
-    std.mem.writeInt(u32, req[w..][0..4], 0, .little);
-    w += 4; // bannerId
-    std.mem.writeInt(u32, req[w..][0..4], 0, .little);
-    w += 4; // bannerExt
-    std.mem.writeInt(u32, req[w..][0..4], 0, .little);
-    w += 4; // startPos
-    std.mem.writeInt(u64, req[w..][0..8], 0, .little);
-    w += 8; // local filetime
-    @memcpy(req[w..][0..filename.len], filename);
-    w += filename.len;
-    req[w] = 0;
-    w += 1; // cstr null
-    std.mem.writeInt(u16, req[0..2], @intCast(w), .little); // reqLen = whole header
+    const w = buildRequest(&req, product, filename, opts);
 
     try writeAll(fd, &[_]u8{0x02}); // BNFTP protocol selector
     try writeAll(fd, req[0..w]);
@@ -336,6 +334,240 @@ pub fn fetch(
     return out;
 }
 
+/// Read only the BNFTP reply header for a request (no body). Returns the file
+/// size the server reports — 0 means "not hosted" (also the short-reply case).
+fn headProbe(
+    gpa: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    product: []const u8,
+    filename: []const u8,
+    opts: FetchOpts,
+    name_out: *[128]u8,
+    name_len: *usize,
+) !u32 {
+    const fd = try dial(gpa, host, port, null);
+    defer _ = close(fd);
+    var req: [512]u8 = undefined;
+    const w = buildRequest(&req, product, filename, opts);
+    try writeAll(fd, &[_]u8{0x02});
+    try writeAll(fd, req[0..w]);
+
+    var hb: [256]u8 = undefined;
+    var got: usize = 0;
+    while (got < hb.len) {
+        const n = readSome(fd, hb[got..]);
+        if (n == 0) break;
+        got += n;
+    }
+    name_len.* = 0;
+    if (got < 8) return 0;
+    const hlen = std.mem.readInt(u32, hb[0..4], .little);
+    const fsize = std.mem.readInt(u32, hb[4..8], .little);
+    if (hlen >= 0x19 and got > 0x18) {
+        const n = cstrAt(hb[0..got], 0x18);
+        const cl = @min(n.len, name_out.len);
+        @memcpy(name_out[0..cl], n[0..cl]);
+        name_len.* = cl;
+    }
+    return fsize;
+}
+
+/// Serialize a BNFTPv1 request header into `buf`; returns its length.
+fn buildRequest(buf: []u8, product: []const u8, filename: []const u8, opts: FetchOpts) usize {
+    var w: usize = 2; // [0x00] reqLen u16, filled at the end
+    std.mem.writeInt(u16, buf[w..][0..2], opts.proto_ver, .little);
+    w += 2;
+    std.mem.writeInt(u32, buf[w..][0..4], fourcc("IX86"), .little);
+    w += 4;
+    std.mem.writeInt(u32, buf[w..][0..4], fourcc(product), .little);
+    w += 4;
+    std.mem.writeInt(u32, buf[w..][0..4], opts.banner_id, .little);
+    w += 4;
+    std.mem.writeInt(u32, buf[w..][0..4], opts.banner_ext, .little);
+    w += 4;
+    std.mem.writeInt(u32, buf[w..][0..4], 0, .little);
+    w += 4; // startPos
+    std.mem.writeInt(u64, buf[w..][0..8], 0, .little);
+    w += 8; // local filetime
+    @memcpy(buf[w..][0..filename.len], filename);
+    w += filename.len;
+    buf[w] = 0;
+    w += 1;
+    std.mem.writeInt(u16, buf[0..2], @intCast(w), .little);
+    return w;
+}
+
+/// Print a dword the way it sits on the wire (4CCs are stored reversed).
+fn dwordChars(v: u32) [4]u8 {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .little);
+    for (&b) |*c| {
+        if (c.* < 0x20 or c.* >= 0x7f) c.* = '.';
+    }
+    return b;
+}
+
+/// Open a BNCS (0x01) connection and complete SID_AUTH_INFO. The caller owns the
+/// socket. `rx` is scratch for the reply.
+fn bnetConnect(
+    gpa: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    product: []const u8,
+    proxy: ?Proxy,
+    rx: []u8,
+) !Socket {
+    const fd = try dial(gpa, host, port, proxy);
+    errdefer _ = close(fd);
+    try writeAll(fd, &[_]u8{0x01});
+
+    var body: [128]u8 = undefined;
+    var w: usize = 0;
+    inline for (.{
+        @as(u32, 0), fourcc("IX86"), fourcc(product), @as(u32, 0x0E),
+        @as(u32, 0), @as(u32, 0),    @as(u32, 0),     @as(u32, 0),
+        @as(u32, 0),
+    }) |v| {
+        std.mem.writeInt(u32, body[w..][0..4], v, .little);
+        w += 4;
+    }
+    for ("USA\x00United States\x00") |c| {
+        body[w] = c;
+        w += 1;
+    }
+    try bncsSend(fd, SID_AUTH_INFO, body[0..w]);
+    _ = try recvUntil(fd, rx, SID_AUTH_INFO);
+    return fd;
+}
+
+/// Ask the server for its ad banner and download it.
+///
+/// The plain-filename BNFTP store does not hold ads (ad000001.smk by name gets
+/// the not-hosted short reply). The real client path is:
+///   SID_CHECKAD -> ad id + extension + filename + click URL
+///   BNFTP with bannerId/bannerExt set -> the banner bytes
+/// SID_GETFILETIME is swept too: the client uses it to resolve server-side files
+/// by request id (0x1A tos, 0x80000001 version, 0x80000002 patcher, 0x80000003
+/// adverts, 0x80000004 gateways, 0x80000005/6 extra work), so the adverts entry
+/// names the ad file without guessing. Each probe gets its own connection —
+/// real bnet drops the socket on a request it does not like, which would
+/// otherwise poison every later step.
+fn adsProbe(
+    gpa: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    product: []const u8,
+    proxy: ?Proxy,
+    out_dir: ?[]const u8,
+) !void {
+    checkAd(gpa, host, port, product, proxy, out_dir) catch |e|
+        std.debug.print("[ads] CHECKAD path failed: {t}\n", .{e});
+    fileTimeSweep(gpa, host, port, product, proxy) catch |e|
+        std.debug.print("[ads] GETFILETIME sweep failed: {t}\n", .{e});
+}
+
+/// SID_GETFILETIME with an empty filename: the server answers with the file it
+/// has for that request id. One connection per id — bnet closes the socket on a
+/// request it rejects.
+fn fileTimeSweep(
+    gpa: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    product: []const u8,
+    proxy: ?Proxy,
+) !void {
+    std.debug.print("\n[ads] SID_GETFILETIME sweep\n", .{});
+    const reqs = [_]struct { id: u32, name: []const u8 }{
+        .{ .id = 0x1A, .name = "TermsOfService" },
+        .{ .id = 0x80000001, .name = "Version" },
+        .{ .id = 0x80000002, .name = "Patcher" },
+        .{ .id = 0x80000003, .name = "Adverts" },
+        .{ .id = 0x80000004, .name = "Gateways" },
+        .{ .id = 0x80000005, .name = "ExtraWork1" },
+        .{ .id = 0x80000006, .name = "ExtraWork2" },
+    };
+    for (reqs) |r| {
+        var rx: [8192]u8 = undefined;
+        const fd = bnetConnect(gpa, host, port, product, proxy, &rx) catch |e| {
+            std.debug.print("  0x{x:0>8} {s:<14} connect failed ({t})\n", .{ r.id, r.name, e });
+            continue;
+        };
+        defer _ = close(fd);
+        var gb: [32]u8 = undefined;
+        std.mem.writeInt(u32, gb[0..4], r.id, .little);
+        std.mem.writeInt(u32, gb[4..8], 0, .little);
+        std.mem.writeInt(u64, gb[8..16], 0, .little);
+        gb[16] = 0; // empty filename: let the server name the file
+        try bncsSend(fd, SID_GETFILETIME, gb[0..17]);
+        const rep = recvUntil(fd, &rx, SID_GETFILETIME) catch |e| {
+            std.debug.print("  0x{x:0>8} {s:<14} no reply ({t})\n", .{ r.id, r.name, e });
+            continue;
+        };
+        const ft = if (rep.body.len >= 16) std.mem.readInt(u64, rep.body[8..16], .little) else 0;
+        const nm = if (rep.body.len > 16) cstrAt(rep.body, 16) else "";
+        std.debug.print("  0x{x:0>8} {s:<14} filetime={d} name=\"{s}\"\n", .{ r.id, r.name, ft, nm });
+    }
+}
+
+fn checkAd(
+    gpa: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    product: []const u8,
+    proxy: ?Proxy,
+    out_dir: ?[]const u8,
+) !void {
+    var rx: [8192]u8 = undefined;
+
+    std.debug.print("\n[ads] SID_CHECKAD (product={s})\n", .{product});
+    const fd = try bnetConnect(gpa, host, port, product, proxy, &rx);
+    defer _ = close(fd);
+    var cb: [16]u8 = undefined;
+    std.mem.writeInt(u32, cb[0..4], fourcc("IX86"), .little);
+    std.mem.writeInt(u32, cb[4..8], fourcc(product), .little);
+    std.mem.writeInt(u32, cb[8..12], 0, .little); // id of last displayed banner
+    std.mem.writeInt(u32, cb[12..16], unixNow(), .little);
+    try bncsSend(fd, SID_CHECKAD, &cb);
+
+    const ad = recvUntil(fd, &rx, SID_CHECKAD) catch |e| {
+        // SocketClosed = the server dropped us (handler gone); a timeout means it
+        // accepted the packet but has no ad to hand out.
+        std.debug.print("  no SID_CHECKAD reply ({t}) — no ad for this product\n", .{e});
+        return;
+    };
+    hexdump("SID_CHECKAD reply", ad.body);
+    if (ad.body.len < 16) return;
+    const ad_id = std.mem.readInt(u32, ad.body[0..4], .little);
+    const ad_ext = std.mem.readInt(u32, ad.body[4..8], .little);
+    const ad_ft = std.mem.readInt(u64, ad.body[8..16], .little);
+    const ad_name = cstrAt(ad.body, 16);
+    const ad_url = cstrAt(ad.body, 16 + ad_name.len + 1);
+    std.debug.print("  adId=0x{x:0>8} ext=0x{x:0>8} \"{s}\" filetime={d}\n", .{ ad_id, ad_ext, dwordChars(ad_ext), ad_ft });
+    std.debug.print("  filename=\"{s}\"  url=\"{s}\"\n", .{ ad_name, ad_url });
+    if (ad_id == 0 or ad_name.len == 0) return;
+
+    // Tell the server the banner was shown, exactly as a real client would.
+    var db: [256]u8 = undefined;
+    std.mem.writeInt(u32, db[0..4], fourcc("IX86"), .little);
+    std.mem.writeInt(u32, db[4..8], fourcc(product), .little);
+    std.mem.writeInt(u32, db[8..12], ad_id, .little);
+    @memcpy(db[12..][0..ad_name.len], ad_name);
+    db[12 + ad_name.len] = 0;
+    try bncsSend(fd, SID_DISPLAYAD, db[0 .. 13 + ad_name.len]);
+
+    const opts: FetchOpts = .{ .banner_id = ad_id, .banner_ext = ad_ext };
+    const bytes = try fetch(gpa, host, port, product, ad_name, opts, null);
+    std.debug.print("\n[ads] BNFTP banner \"{s}\": {d} bytes\n", .{ ad_name, bytes.len });
+    if (bytes.len == 0) return;
+    const out = if (out_dir) |d|
+        try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ d, basename(ad_name) }, 0)
+    else
+        try std.fmt.allocPrintSentinel(gpa, "bnftp-{s}", .{basename(ad_name)}, 0);
+    try writeFile(out.ptr, bytes);
+    std.debug.print("  saved -> {s}\n", .{out});
+}
+
 /// Receive BNCS packets until one with id == want. Real bnet sends SID_PING
 /// (0x25) on connect — echo its cookie back (servers gate further replies on it)
 /// and keep reading. Unrelated packets are hexdumped and skipped.
@@ -369,6 +601,9 @@ pub fn run(init: std.process.Init.Minimal) !void {
     var old_ver: u32 = 1; // deliberately-old EXE version to provoke "must upgrade"
     var head_only = false; // read only the BNFTP reply header (size), skip the body
     var bnftp_only = false; // skip the AUTH_INFO handshake (BNFTP needs no auth)
+    var ads = false; // SID_CHECKAD -> download the ad banner by id+extension
+    var ad_id: u32 = 0;
+    var ad_ext: u32 = 0;
     var positional: [3][]const u8 = undefined;
     var npos: usize = 0;
 
@@ -399,6 +634,20 @@ pub fn run(init: std.process.Init.Minimal) !void {
             head_only = true;
         } else if (std.mem.eql(u8, a, "--bnftp-only")) {
             bnftp_only = true;
+        } else if (std.mem.eql(u8, a, "--ads")) {
+            ads = true;
+        } else if (std.mem.eql(u8, a, "--ad-id")) {
+            ad_id = try std.fmt.parseInt(u32, it.next() orelse return err("--ad-id wants N"), 0);
+        } else if (std.mem.eql(u8, a, "--ad-ext")) {
+            // "smk" -> the extension chars in wire order; 0xNNNNNNNN -> verbatim dword.
+            const s = it.next() orelse return err("--ad-ext wants EXT|0xN");
+            if (std.mem.startsWith(u8, s, "0x")) {
+                ad_ext = try std.fmt.parseInt(u32, s, 0);
+            } else {
+                var eb: [4]u8 = .{ 0, 0, 0, 0 };
+                @memcpy(eb[0..@min(4, s.len)], s[0..@min(4, s.len)]);
+                ad_ext = std.mem.readInt(u32, &eb, .little);
+            }
         } else if (std.mem.eql(u8, a, "--timeout")) {
             recv_timeout_ms = try std.fmt.parseInt(u32, it.next() orelse return err("--timeout wants MS"), 10);
         } else if (std.mem.eql(u8, a, "--old-ver")) {
@@ -417,6 +666,13 @@ pub fn run(init: std.process.Init.Minimal) !void {
         std.debug.print("== via SOCKS5 {s}:{d}{s} ==\n", .{ px.host, px.port, if (px.user.len > 0) " (auth)" else "" });
     }
     std.debug.print("== target {s}:{d}  product={s}  protoVer=0x{x:0>4} ==\n", .{ host, port, product, proto_ver });
+
+    if (ads) {
+        try adsProbe(gpa, host, port, product, proxy, out_dir);
+        std.debug.print("\ndone.\n", .{});
+        return;
+    }
+    const fopts: FetchOpts = .{ .proto_ver = proto_ver, .banner_id = ad_id, .banner_ext = ad_ext };
 
     // ── Step 1: SID_AUTH_INFO to learn the MPQ filename (CD-key-free) ──
     // Skipped with --bnftp-only (BNFTP is unauthenticated; one conn per file).
@@ -516,7 +772,7 @@ pub fn run(init: std.process.Init.Minimal) !void {
     // Common path (no proxy, full body): use the reusable fetch() helper.
     if (proxy == null and !head_only) {
         var filetime: u64 = 0;
-        const body = try fetch(gpa, host, port, product, file_to_get, .{ .proto_ver = proto_ver }, &filetime);
+        const body = try fetch(gpa, host, port, product, file_to_get, fopts, &filetime);
         std.debug.print("\n[2] BNFTP fetched \"{s}\": {d} file bytes (filetime={d})\n", .{ file_to_get, body.len, filetime });
         const out = if (out_dir) |d|
             try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ d, basename(file_to_get) }, 0)
@@ -534,27 +790,7 @@ pub fn run(init: std.process.Init.Minimal) !void {
         defer _ = close(fd);
 
         var req: [512]u8 = undefined;
-        var w: usize = 0;
-        w += 2; // [0x00] reqLen u16, filled below
-        std.mem.writeInt(u16, req[w..][0..2], proto_ver, .little);
-        w += 2;
-        std.mem.writeInt(u32, req[w..][0..4], fourcc("IX86"), .little);
-        w += 4; // platform
-        std.mem.writeInt(u32, req[w..][0..4], fourcc(product), .little);
-        w += 4; // product
-        std.mem.writeInt(u32, req[w..][0..4], 0, .little);
-        w += 4; // bannerId
-        std.mem.writeInt(u32, req[w..][0..4], 0, .little);
-        w += 4; // bannerExt
-        std.mem.writeInt(u32, req[w..][0..4], 0, .little);
-        w += 4; // startPos
-        std.mem.writeInt(u64, req[w..][0..8], 0, .little);
-        w += 8; // local filetime
-        @memcpy(req[w..][0..file_to_get.len], file_to_get);
-        w += file_to_get.len;
-        req[w] = 0;
-        w += 1; // cstr null
-        std.mem.writeInt(u16, req[0..2], @intCast(w), .little); // reqLen = whole header
+        const w = buildRequest(&req, product, file_to_get, fopts);
 
         try writeAll(fd, &[_]u8{0x02}); // BNFTP protocol selector
         try writeAll(fd, req[0..w]);

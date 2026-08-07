@@ -11,6 +11,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const net = b.dependency("d2_net", .{ .target = target, .optimize = optimize });
+    const core = b.dependency("d2_core", .{ .target = target, .optimize = optimize });
+    const util = b.dependency("d2_util", .{ .target = target, .optimize = optimize });
+    const client = b.dependency("d2_client", .{ .target = target, .optimize = optimize });
+    const libd2 = [_]std.Build.Module.Import{
+        .{ .name = "d2-net", .module = net.module("d2-net") },
+        .{ .name = "d2-core", .module = core.module("d2-core") },
+        .{ .name = "d2-util", .module = util.module("d2-util") },
+        .{ .name = "d2-client", .module = client.module("d2-client") },
+    };
+
     // ── clientless: BNCS auth + CD-keys + OLS login + MCP realm/char + chat/ladder +
     //    D2GS game entry. Uses libc sockets (std.net is gone in 0.16). ──
     const exe = b.addExecutable(.{
@@ -20,6 +31,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .imports = &libd2,
         }),
     });
     exe.root_module.addAnonymousImport("checkrev_core", .{ .root_source_file = b.path("src/checkrev_core.zig") });
@@ -49,12 +61,13 @@ pub fn build(b: *std.Build) void {
     // ── crypto unit tests: standard SHA-1 (CheckRevision), WC3 26-char CD-key decode,
     //    Blizzard broken SHA-1 (OLS password) — each module carries its own `test`s. ──
     const test_step = b.step("test", "Run the crypto unit tests");
-    for ([_][]const u8{ "src/checkrev_core.zig", "src/cdkey.zig", "src/xsha1.zig", "src/game/bitreader.zig", "src/game/itemstatcost.zig", "src/game/itemtypes.zig", "src/game/item.zig", "src/game/packets.zig", "src/game/world.zig" }) |path| {
+    for ([_][]const u8{ "src/checkrev_core.zig", "src/cdkey.zig", "src/xsha1.zig", "src/game/bot.zig" }) |path| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),
                 .target = target,
                 .optimize = optimize,
+                .imports = &libd2,
             }),
         });
         test_step.dependOn(&b.addRunArtifact(t).step);

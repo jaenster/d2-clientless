@@ -19,10 +19,13 @@ const std = @import("std");
 const core = @import("checkrev_core");
 const cdkey = @import("cdkey");
 const xsha1 = @import("xsha1");
-const huffman = @import("huffman.zig");
+const util = @import("d2-util");
+const huffman = util.huffman;
+const frame = util.frame;
 const bnftp = @import("bnftp");
-const packets = @import("game/packets.zig");
-const world_mod = @import("game/world.zig");
+const packets = @import("d2-net").sc;
+const world_mod = @import("d2-client");
+const bot = @import("game/bot.zig");
 
 // ── libc sockets (native host target; std.net/std.posix wrappers are gone in 0.16) ──
 const Socket = c_int;
@@ -36,11 +39,19 @@ extern "c" fn getentropy(buf: *anyopaque, n: usize) c_int; // CSPRNG seed (<=256
 extern "c" fn setsockopt(fd: c_int, level: c_int, optname: c_int, optval: *const anyopaque, optlen: c_uint) c_int;
 const SOCK_STREAM: c_int = 1;
 
+const POLLIN: i16 = 0x0001;
+const pollfd = extern struct { fd: c_int, events: i16, revents: i16 };
+extern "c" fn poll(fds: *pollfd, nfds: c_uint, timeout: c_int) c_int;
+
 fn setRecvTimeout(fd: Socket, ms: u32) void {
     const tv = std.posix.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
     _ = setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &tv, @sizeOf(std.posix.timeval));
 }
 extern "c" fn gettimeofday(tv: *std.posix.timeval, tz: ?*anyopaque) c_int;
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+fn c_getenv(name: [*:0]const u8) ?[*:0]const u8 {
+    return getenv(name);
+}
 fn nowMs() i64 {
     var tv: std.posix.timeval = undefined;
     _ = gettimeofday(&tv, null);
@@ -382,6 +393,7 @@ const SID_GETCHANNELLIST = 0x0b;
 const SID_JOINCHANNEL = 0x0c;
 const SID_CHATCOMMAND = 0x0e;
 const SID_CHATEVENT = 0x0f;
+const SID_CHECKAD = 0x15;
 const SID_GETADVLISTEX = 0x09; // open-bnet public game list (peer-hosted games)
 const MCP_STARTUP = 0x01;
 const MCP_CHARCREATE = 0x02;
@@ -583,7 +595,7 @@ fn feedStream(world: *world_mod.World, bytes: []const u8, log: bool) usize {
         }
         if (id == 0xAE and n > 3) {
             var dbuf: [16384]u8 = undefined;
-            if (huffman.decompress(bytes[off + 3 .. off + n], &dbuf)) |dlen| {
+            if (huffman.decompress(&dbuf, bytes[off + 3 .. off + n])) |dlen| {
                 var io: usize = 0;
                 while (io < dlen) {
                     const isz = scPacketSize(dbuf[io..dlen]) orelse break;
@@ -605,6 +617,132 @@ fn feedStream(world: *world_mod.World, bytes: []const u8, log: bool) usize {
     return count;
 }
 
+// `clientless --meph-run <host:port> <gameid>` — a self-contained Mephisto run against the
+// pure-Zig d2gs-standalone host (no BNCS/MCP, no real engine). We connect straight to the game
+// port, do the standalone's join handshake (GAMELOGON 0x68 with the gameid in the token field ->
+// AF00 + GameFlags 0x01 + LoadSuccess 0x02 -> ENTERGAME 0x6B), then read the S->C world burst
+// while ticking the bot.Driver, which walks the inter-level warp graph to Durance 3 and kills the
+// boss there. The standalone declares AF00 (compression off) and length-prefixes every packet
+// after the raw greeting (SendPacketToClient @0x52b330), so nextFrame demuxes the stream.
+fn mephSend(ctx: *anyopaque, bytes: []const u8) void {
+    const fd: *Socket = @ptrCast(@alignCast(ctx));
+    if (c_getenv("MEPH_VERBOSE") != null) std.debug.print("[meph] -> C->S 0x{x:0>2} ({d} bytes)\n", .{ bytes[0], bytes.len });
+    writeAll(fd.*, bytes) catch {};
+}
+
+fn mephRun(gpa: std.mem.Allocator, hostport: ?[]const u8, gameid_arg: ?[]const u8) !void {
+    const hp = hostport orelse {
+        std.debug.print("usage: clientless --meph-run <host:port> <gameid>\n", .{});
+        return;
+    };
+    const gid_str = gameid_arg orelse {
+        std.debug.print("usage: clientless --meph-run <host:port> <gameid>\n", .{});
+        return;
+    };
+    const colon = std.mem.lastIndexOfScalar(u8, hp, ':') orelse {
+        std.debug.print("--meph-run: expected host:port, got \"{s}\"\n", .{hp});
+        return;
+    };
+    const host = hp[0..colon];
+    const port = std.fmt.parseInt(u16, hp[colon + 1 ..], 10) catch {
+        std.debug.print("--meph-run: bad port in \"{s}\"\n", .{hp});
+        return;
+    };
+    const gameid = std.fmt.parseInt(u16, gid_str, 10) catch {
+        std.debug.print("--meph-run: bad gameid \"{s}\"\n", .{gid_str});
+        return;
+    };
+
+    var fd = connectResolved(gpa, host, port) catch {
+        std.debug.print("[meph] connect to {s}:{d} failed\n", .{ host, port });
+        return;
+    };
+    defer _ = close(fd);
+    // Short recv timeout so the driver ticks ~20x/sec even when the server is quiet — the bot must
+    // keep issuing run-toward-target commands to cross the level to Mephisto, not stall waiting on
+    // incoming packets (a 3s timeout made it crawl one step per 3s and never reach the boss).
+    setRecvTimeout(fd, 50);
+    std.debug.print("[meph] connected {s}:{d}, gameid={d}\n", .{ host, port, gameid });
+
+    // GAMELOGON (0x68), 37 bytes — the standalone resolves the game by the u16 token@5 (== gameid).
+    var gl: [37]u8 = [_]u8{0} ** 37;
+    gl[0] = 0x68;
+    std.mem.writeInt(u16, gl[5..7], gameid, .little); // token field == gameid (qqserver-rewrite slot)
+    gl[7] = 1; // nCharClass (Sorceress)
+    std.mem.writeInt(u32, gl[8..12], 0x0e, .little); // nVerByte (1.14d)
+    @memcpy(gl[21..][0..3], "Bot"); // szCharName
+    try writeAll(fd, &gl);
+    std.debug.print("[meph] -> GAMELOGON (0x68) gameid={d}\n", .{gameid});
+
+    var world = world_mod.World.init(gpa);
+    world.verbose = c_getenv("MEPH_VERBOSE") != null;
+    defer world.deinit();
+
+    var driver = bot.Driver{ .ctx = @ptrCast(&fd), .sendFn = &mephSend };
+
+    var sbuf: [32768]u8 = undefined;
+    var slen: usize = 0;
+    var sent_enter = false;
+    var af_greeted = false; // consumed the raw 0xAF greeting; the rest of the stream is framed
+    const deadline = nowMs() + 180000;
+    while (nowMs() < deadline) {
+        var off: usize = 0;
+        while (off < slen) {
+            // The raw 0xAF <flag> greeting is UNFRAMED (2 bytes). Everything after is
+            // length-prefixed (SendPacketToClient @0x52b330). The standalone declares AF00
+            // (compression off), so inner packets are never Huffman.
+            if (!af_greeted) {
+                if (slen - off < 2) break;
+                if (sbuf[off] == 0xAF) {
+                    af_greeted = true;
+                    off += 2;
+                    continue;
+                }
+                af_greeted = true; // no greeting on this dialect — treat the stream as framed
+            }
+            const fr = frame.decode(sbuf[off..slen]) orelse break; // need more bytes
+            const pkt = fr.payload;
+            const id = pkt[0];
+            world.apply(pkt);
+            // LoadSuccess (0x02): the standalone is ready for us to enter — send the paired
+            // ping (0x6A) + ENTERGAME (0x6B); the world burst (LoadAct/CreatePlayer/monsters)
+            // follows. From then on the driver steers.
+            if (id == 0x02 and !sent_enter) {
+                try writeAll(fd, &[_]u8{ 0x6a, 0x6b });
+                sent_enter = true;
+                std.debug.print("[meph] -> ENTERGAME (0x6a ping + 0x6b)\n", .{});
+            }
+            off += fr.size;
+        }
+        if (off > 0) {
+            std.mem.copyForwards(u8, sbuf[0 .. slen - off], sbuf[off..slen]);
+            slen -= off;
+        }
+        // Drive the bot: one command per read pass keeps pace with the 25fps tick without flooding.
+        if (sent_enter and driver.step(&world) == .done) {
+            std.debug.print("[meph] run complete\n", .{});
+            world.dumpSummary();
+            return;
+        }
+
+        // Poll with a 50ms budget so the driver ticks ~20x/sec even when the server is quiet — a
+        // plain blocking read() stalled the loop (SO_RCVTIMEO wasn't driving the tick), so the bot
+        // never issued run-toward-boss commands across an idle level. poll timeout => idle tick.
+        var pfd = pollfd{ .fd = fd, .events = POLLIN, .revents = 0 };
+        const pr = poll(&pfd, 1, 50);
+        if (pr <= 0 or (pfd.revents & POLLIN) == 0) continue; // idle tick — driver already stepped
+        const nr = read(fd, sbuf[slen..].ptr, sbuf.len - slen);
+        if (nr == 0) {
+            std.debug.print("[meph] connection closed (level={d})\n", .{world.level_id});
+            break;
+        }
+        if (nr < 0) continue; // idle/timeout tick — loop and let the driver retry
+        slen += @intCast(nr);
+    }
+    std.debug.print("[meph] finished (phase={s}, level={d})\n", .{ @tagName(driver.phase), world.level_id });
+    world.dumpSummary();
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = std.heap.page_allocator;
 
@@ -615,6 +753,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (peek.next()) |sub| {
             if (std.mem.eql(u8, sub, "bnftp")) return bnftp.run(init);
             if (std.mem.eql(u8, sub, "replay")) return replay(gpa, peek.next());
+            if (std.mem.eql(u8, sub, "--meph-run") or std.mem.eql(u8, sub, "meph-run"))
+                return mephRun(gpa, peek.next(), peek.next());
         }
     }
 
@@ -633,6 +773,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var listen_sec: u32 = 0; // stay in chat reading events for N seconds (chat-session mode)
     var delay_sec: u32 = 0; // wait N seconds after joining before say/kick (2-client ordering)
     var game_arg: ?[]const u8 = null; // --game <name>: create+join the game and enter it on the GS
+    var char_arg: ?[]const u8 = null; // --char <name>: which character to log on with (default: first)
+    var goto_waypoint = false; // --goto-waypoint: after joining, actually walk to the level's waypoint
     var gs_port: u16 = 4000; // GS game port (qqserver public port)
     var gs_tls = false; // --gs-tls: wrap the GS leg in TLS (Blizzard's :443 D2GS-over-TLS farm)
     var gs_host: ?[]const u8 = null; // --gs-host: override the GS IP (still use JOINGAME token/hash)
@@ -666,6 +808,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             delay_sec = std.fmt.parseInt(u32, args.next() orelse "0", 10) catch 0;
         } else if (std.mem.eql(u8, a, "--game")) {
             game_arg = args.next();
+        } else if (std.mem.eql(u8, a, "--char")) {
+            char_arg = args.next();
+        } else if (std.mem.eql(u8, a, "--goto-waypoint")) {
+            goto_waypoint = true;
         } else if (std.mem.eql(u8, a, "--gs-port")) {
             gs_port = std.fmt.parseInt(u16, args.next() orelse "4000", 10) catch 4000;
         } else if (std.mem.eql(u8, a, "--gs-tls")) {
@@ -723,6 +869,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\
             \\game / chat:
             \\  --game <name>        create + join the game and enter it on the GS
+            \\  --char <name>        character to log on with (default: the first one listed)
+            \\  --goto-waypoint      after joining, walk to this level's waypoint and report
             \\  --gs-port <n>        GS game port (default 4000; 443 when --gs-tls)
             \\  --gs-tls             join the GS over TLS (Blizzard's :443 D2GS-over-TLS farm)
             \\  --gs-host <ip>       override the GS IP (keep JOINGAME token/hash; e.g. a :443 gateway)
@@ -1016,12 +1164,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 const stat = cstrAt(cl, off2);
                 off2 += stat.len + 1;
                 std.debug.print("  - char \"{s}\"\n", .{name});
-                if (cname_len == 0 and name.len > 0 and name.len < cname_buf.len) {
+                if (name.len == 0 or name.len >= cname_buf.len) continue;
+                // --char picks a specific one (the account may hold several, and a char already
+                // in a game can't be logged on twice); without it, take the first listed.
+                const wanted = if (char_arg) |want| std.ascii.eqlIgnoreCase(want, name) else cname_len == 0;
+                if (wanted) {
                     @memcpy(cname_buf[0..name.len], name);
                     cname_len = name.len;
                 }
             }
         }
+
+        if (cname_len == 0) if (char_arg) |want| {
+            std.debug.print("[MCP_CHARLIST2] no character named \"{s}\" on this account\n", .{want});
+            return;
+        };
 
         // ── MCP_CHARCREATE — make a character if the account has none ──
         if (cname_len == 0) {
@@ -1078,10 +1235,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const cg_token = if (cgr.len >= 4) std.mem.readInt(u16, cgr[2..4], .little) else 0;
             const cg_result = if (cgr.len >= 10) std.mem.readInt(u32, cgr[6..10], .little) else 0xffffffff;
             std.debug.print("[MCP_CREATEGAME] \"{s}\" token=0x{x} result=0x{x}  => {s}\n", .{ gname, cg_token, cg_result, createGameMeaning(cg_result) });
-            // 0x1f = "game already exists" (e.g. left over from a prior run): fall through and
-            // JOIN it instead of bailing. Any other non-zero create result is fatal.
-            if (cg_result != 0 and cg_result != 0x1f) return;
-            if (cg_result == 0x1f) std.debug.print("[MCP_CREATEGAME] game exists -> joining it\n", .{});
+            // A failed create is not the end: the game may simply be up already (another player
+            // made it, or a previous run left it). 0x1f says so outright; an older realmd reports
+            // the generic 0x1e for a taken name too. So always fall through to JOINGAME — if the
+            // game really doesn't exist the join answers 0x29 and we bail there with that reason.
+            if (cg_result != 0) std.debug.print("[MCP_CREATEGAME] create failed -> trying to JOIN the existing game\n", .{});
 
             // MCP_JOINGAME (0x04): reqid, name, pass
             var jgb: [64]u8 = undefined;
@@ -1242,12 +1400,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var slen: usize = 0;
             var handshook = false;
             var sent6b = false;
+            var next_step_at: i64 = 0;
+            var steps_sent: u32 = 0;
+            var walk_done = false;
             var world_bytes: usize = 0;
             var pkt_count: usize = 0;
+            // Wire dialect, set from the GS's own AF greeting's compress flag (AF[1]):
+            //   AF00 (our standalone) = compression OFF -> the whole S->C stream is RAW opcodes with
+            //     NO length prefix; demux by the per-opcode size table (scPacketSize), like the real
+            //     client's uncompressed recv path.
+            //   AF01 (real 1.14d engine) = compression ON -> packets ride length-prefixed +
+            //     Huffman-compressed blocks (SendPacketToClient @0x52b330); demux via nextFrame.
+            var compressed = false;
 
             // World model rebuilt from the S->C stream (game/world.zig). Each framed packet is
             // fed to world.apply; the 0xAE container's inner packets are fed individually.
             var world = world_mod.World.init(gpa);
+            world.expectLocalPlayer(charname); // so ghosts of ourselves cannot be mistaken for us
             world.verbose = verbose;
             defer world.deinit();
 
@@ -1259,7 +1428,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 const hs_deadline = nowMs() + 5000;
                 while (!handshook and nowMs() < hs_deadline) {
                     if (slen >= 2 and sbuf[0] == 0xAF) {
-                        std.debug.print("[GS] <- 0xAF connection established (D2GS_Connected)\n", .{});
+                        // The second byte is the PHASE flag, and it counts even on this first
+                        // greeting: qqserver greets at accept time with `af 01` and then SWALLOWS
+                        // the backend's own greeting rather than forwarding a second one, so behind
+                        // the gateway this is the only 0xAF we ever see. Dropping it without
+                        // recording the flag leaves us demuxing a compressed stream as plaintext —
+                        // the first frame's length byte reads as an opcode and everything desyncs.
+                        compressed = sbuf[1] == 0x01;
+                        std.debug.print("[GS] <- 0xAF{x:0>2} connection established (D2GS_Connected){s}\n", .{
+                            sbuf[1], if (compressed) " — compressed phase" else "",
+                        });
                         rawDump(sbuf[0..2]);
                         std.mem.copyForwards(u8, sbuf[0 .. slen - 2], sbuf[2..slen]);
                         slen -= 2;
@@ -1304,62 +1482,114 @@ pub fn main(init: std.process.Init.Minimal) !void {
             while (nowMs() < deadline) {
                 var off: usize = 0;
                 while (off < slen) {
-                    const n = scPacketSize(sbuf[off..slen]) orelse break; // need more bytes
-                    if (n == 0) { // invalid opcode = desync; resync one byte
-                        std.debug.print("[GS] <- desync at 0x{x:0>2}, resyncing\n", .{sbuf[off]});
-                        off += 1;
+                    // A raw 0xAF <flag> greeting is UNFRAMED (2 bytes). The pre-loop above strips the
+                    // FIRST one (qqserver's accept-time 0xAF00), but the GS ALSO emits its own 0xAF
+                    // greeting once spliced (AF00 = standalone plaintext, AF01 = real engine, which
+                    // flips to compressed mode) — skip it inline and record the compress flag so we
+                    // pick the right demux below.
+                    if (sbuf[off] == 0xAF) {
+                        if (slen - off < 2) break;
+                        if (sbuf[off + 1] == 0x01) {
+                            handshook = true;
+                            compressed = true; // AF01: engine flips to compressed/length-framed phase
+                        }
+                        off += 2;
                         continue;
                     }
-                    const id = sbuf[off];
-                    var nb: [8]u8 = undefined;
-                    std.debug.print("[GS] <- {s} 0x{x:0>2} ({d} bytes)\n", .{ packets.label(id, &nb), id, n });
-                    if (verbose) rawDump(sbuf[off .. off + n]);
-                    pkt_count += 1;
-                    if (sent6b) world_bytes += n;
-                    if (id == 0xAE and n > 3) { // compressed blob: huffman-decompress + parse inner
-                        var dbuf: [16384]u8 = undefined;
-                        if (huffman.decompress(sbuf[off + 3 .. off + n], &dbuf)) |dlen| {
-                            std.debug.print("    decompressed {d} -> {d} bytes\n", .{ n - 3, dlen });
-                            var io: usize = 0;
-                            while (io < dlen) {
-                                const isz = scPacketSize(dbuf[io..dlen]) orelse break;
-                                if (isz == 0) break;
-                                const iid = dbuf[io];
-                                var inb: [8]u8 = undefined;
-                                std.debug.print("    [inner] {s} 0x{x:0>2} ({d} bytes)\n", .{ packets.label(iid, &inb), iid, isz });
-                                world.apply(dbuf[io .. io + isz]);
-                                if (iid == 0x02 and !sent6b) {
-                                    pace();
-                                    try conn.wr(&[_]u8{0x6b});
-                                    sent6b = true;
-                                    std.debug.print("[GS] -> JOINGAME (0x6b)  (0x02 inside compressed blob)\n", .{});
-                                }
-                                io += isz;
-                            }
-                        }
+                    // Peel one unit off the S->C stream and reduce it to PLAINTEXT packet bytes.
+                    //   • compressed phase (AF01 — the real 1.14d engine, and so anything behind
+                    //     qqserver): a length-prefixed frame whose payload is Huffman-compressed
+                    //     (NET_D2GS_SERVER_SendPacketToClient @0x52b330). Decompressing it yields a
+                    //     CONCATENATION of opcode packets. Compression is per-FRAME here — the 0xAE
+                    //     container is a different, older shape, not how this phase works.
+                    //   • plaintext phase (AF00): raw opcodes, no framing at all.
+                    var plainbuf: [16384]u8 = undefined;
+                    var plain: []const u8 = undefined;
+                    var advance: usize = 0;
+                    if (compressed) {
+                        const fr = frame.decode(sbuf[off..slen]) orelse break; // need more bytes
+                        const dlen = huffman.decompress(&plainbuf, fr.payload) orelse {
+                            std.debug.print("[GS] {d}B frame failed to huffman-decompress — desync\n", .{fr.payload.len});
+                            break;
+                        };
+                        if (verbose) std.debug.print("    frame {d}B -> {d}B plaintext\n", .{ fr.payload.len, dlen });
+                        plain = plainbuf[0..dlen];
+                        advance = fr.size;
                     } else {
-                        world.apply(sbuf[off .. off + n]);
+                        const psz = scPacketSize(sbuf[off..slen]) orelse break; // need more bytes
+                        if (psz == 0) break; // invalid opcode = desync
+                        plain = sbuf[off .. off + psz];
+                        advance = psz;
                     }
-                    // REAL engine: HandShake 0x0b arrives first and the engine waits for our 0x6b
-                    // before streaming the world. Fire ENTERGAME immediately on the HandShake.
-                    if (id == 0x0b and !sent6b) {
-                        pace();
-                        try conn.wr(&[_]u8{0x6b});
-                        sent6b = true;
-                        deadline = nowMs() + 12000; // give the world stream time after ENTERGAME
-                        std.debug.print("[GS] -> ENTERGAME (0x6b)  (after HandShake 0x0b — real engine)\n", .{});
+
+                    // Split the plaintext into packets by the per-opcode size table, exactly as the
+                    // real client demuxes a frame payload, and apply each to the world model.
+                    var po: usize = 0;
+                    while (po < plain.len) {
+                        const psz = scPacketSize(plain[po..]) orelse break;
+                        if (psz == 0 or po + psz > plain.len) break; // unknown opcode / truncated
+                        const pkt = plain[po .. po + psz];
+                        const id = pkt[0];
+                        po += psz;
+
+                        var nb: [8]u8 = undefined;
+                        std.debug.print("[GS] <- {s} 0x{x:0>2} ({d} bytes)\n", .{ packets.label(id, &nb), id, psz });
+                        if (verbose) rawDump(pkt);
+                        pkt_count += 1;
+                        if (sent6b) world_bytes += psz;
+                        world.apply(pkt);
+
+                        // Send JOINGAME (0x6b) exactly like the real client: NOT off 0x01 GameFlags, but
+                        // off the 1-byte StateCommand that follows it. The engine's
+                        // CLIENT_SendGameFlagsAndSetState1 sends GameFlags(0x01) THEN SendStateCommand(0)
+                        // = a bare 0x00, and only that 0x00 drives the client to emit 0x6b (its
+                        // Incoming0x01_GameFlags handler just sets diff/exp/UI).
+                        //   • our standalone: fire on 0x00 StateCommand.
+                        //   • real 1.14d engine: fire on 0x0b HandShake.
+                        // 0x02 kept for older captures where the server echoed a LoadSuccess back.
+                        if ((id == 0x00 or id == 0x02 or id == 0x0b) and !sent6b) {
+                            pace();
+                            try conn.wr(&[_]u8{0x6b});
+                            sent6b = true;
+                            deadline = nowMs() + 12000; // give the world stream time after ENTERGAME
+                            std.debug.print("[GS] -> JOINGAME (0x6b)  (in response to 0x{x:0>2})\n", .{id});
+                        }
                     }
-                    if (id == 0x02 and !sent6b) { // raw LoadSuccess -> send JOINGAME (standalone GS fallback)
-                        pace();
-                        try conn.wr(&[_]u8{0x6b});
-                        sent6b = true;
-                        std.debug.print("[GS] -> JOINGAME (0x6b)  (in response to 0x02 LoadSuccess)\n", .{});
-                    }
-                    off += n;
+                    off += advance;
                 }
                 if (off > 0) {
                     std.mem.copyForwards(u8, sbuf[0 .. slen - off], sbuf[off..slen]);
                     slen -= off;
+                }
+
+                // Walk to the waypoint, one range-gated step per pass. libd2 owns both halves:
+                // the world model says where we and the waypoint are, and `Actor` turns that into
+                // a command the server will accept.
+                if (goto_waypoint and sent6b and nowMs() >= next_step_at) {
+                    next_step_at = nowMs() + 400; // the server needs time to move us
+                    if (world.waypoint() catch null) |wp| {
+                        const actor = world_mod.Actor{ .world = &world };
+                        var cmd: [world_mod.Actor.MAX_COMMAND]u8 = undefined;
+                        const target = world_mod.Point{ .x = wp.x, .y = wp.y };
+                        if (actor.moveToward(target, true, &cmd, 4) catch null) |bytes| {
+                            const me = actor.position().?;
+                            std.debug.print("[GS] -> RunToLocation ({d},{d}) — at ({d},{d}), {d} to go\n", .{
+                                std.mem.readInt(u16, bytes[1..3], .little),
+                                std.mem.readInt(u16, bytes[3..5], .little),
+                                me.x, me.y, world_mod.play.distance(me, target),
+                            });
+                            conn.wr(bytes) catch {};
+                            deadline = nowMs() + 8000;
+                            steps_sent += 1;
+                        } else if (!walk_done) {
+                            walk_done = true;
+                            const me = actor.position().?;
+                            std.debug.print("[GS] ARRIVED at the waypoint: ({d},{d}) vs waypoint ({d},{d}) after {d} commands\n", .{
+                                me.x, me.y, wp.x, wp.y, steps_sent,
+                            });
+                            deadline = nowMs() + 1500;
+                        }
+                    }
                 }
                 const nr = conn.rd(sbuf[slen..]);
                 if (nr == 0) {
@@ -1369,11 +1599,51 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 if (nr < 0) continue; // timeout tick
                 slen += @intCast(nr);
             }
-            if (sent6b)
+            if (sent6b) {
                 std.debug.print("[GS] joined: {d} packets, {d} world bytes after 0x6b  => IN GAME\n" ++
-                    "[GS] world: act={d} level={d} mapSeed=0x{x:0>8} units={d}\n", .{ pkt_count, world_bytes, world.act, world.level_id, world.map_seed, world.unitCount() })
-            else
-                std.debug.print("[GS] never saw 0x02 LoadSuccess ({d} packets) — 0x6b not sent\n", .{pkt_count});
+                    "[GS] world: act={d} level={d} mapSeed=0x{x:0>8} units={d}\n", .{ pkt_count, world_bytes, world.act, world.level_id, world.map_seed, world.unitCount() });
+                if (world.waypoint() catch null) |wp| {
+                    const p = world.playerPos();
+                    std.debug.print("[GS] waypoint: class={d} guid=0x{x} at ({d},{d}){s}\n", .{
+                        wp.class_id, wp.guid, wp.x, wp.y,
+                        if (p) |pp| blk: {
+                            var b: [48]u8 = undefined;
+                            break :blk std.fmt.bufPrint(&b, "  (player at ({d},{d}))", .{ pp.x, pp.y }) catch "";
+                        } else "",
+                    });
+                } else std.debug.print("[GS] waypoint: none in view\n", .{});
+                var by_where = [_]u32{0} ** 8;
+                var eq_n: usize = 0;
+                var it2 = world.items.iterator();
+                while (it2.next()) |e| {
+                    const loc = e.value_ptr.where;
+                    by_where[@min(@intFromEnum(loc), by_where.len - 1)] += 1;
+                    if (loc == .equipped and eq_n < 12) {
+                        const item = &e.value_ptr.item;
+                        std.debug.print("[GS]   equipped slot={d}: \"{s}\" {s}{s} ilvl={d} sockets={d} stats={d}\n", .{
+                            item.body_loc,      item.codeSlice(), @tagName(item.quality),
+                            if (item.ethereal()) " eth" else "", item.ilvl,
+                            item.sockets,       item.n_stats,
+                        });
+                        eq_n += 1;
+                    }
+                }
+                std.debug.print("[GS] items: {d} total (stored={d} equipped={d} belt={d} ground={d} cursor={d})\n", .{
+                    world.items.count(), by_where[0], by_where[1], by_where[2], by_where[3], by_where[4],
+                });
+                const cov = world.coverage();
+                std.debug.print("[GS] parsed: {d}/{d} packets ({d}%) — {d} mirrored, {d} recognised-no-state, {d} unknown\n", .{ cov.applied + cov.acknowledged, cov.total(), cov.percent(), cov.applied, cov.acknowledged, cov.ignored });
+                var rest: [32]world_mod.World.IgnoredOp = undefined;
+                const nrest = world.ignoredOpcodes(&rest);
+                if (nrest != 0) {
+                    std.debug.print("[GS] still unmodelled:", .{});
+                    var nb: [8]u8 = undefined;
+                    for (rest[0..@min(nrest, 8)]) |e|
+                        std.debug.print(" 0x{x:0>2}x{d}({s})", .{ e.op, e.n, packets.label(e.op, &nb) });
+                    std.debug.print("\n", .{});
+                }
+            } else
+                std.debug.print("[GS] never saw a pre-world handshake packet ({d} packets) — 0x6b not sent\n", .{pkt_count});
             return;
         }
 
@@ -1412,6 +1682,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
         @memcpy(jc[4 .. 4 + channel_arg.len], channel_arg);
         jc[4 + channel_arg.len] = 0;
         try send(fd, SID_JOINCHANNEL, jc[0 .. 5 + channel_arg.len]);
+
+        // SID_CHECKAD — real clients poll this from the chat screen every 15s. The
+        // reply carries the banner id + extension needed to BNFTP the ad itself
+        // (see bnftp.zig --ads). A logged-in session is the only place ads can be
+        // gated behind, so ask here as well as pre-auth.
+        var adb: [16]u8 = undefined;
+        std.mem.writeInt(u32, adb[0..4], fourcc("IX86"), .little);
+        std.mem.writeInt(u32, adb[4..8], fourcc(product), .little);
+        std.mem.writeInt(u32, adb[8..12], 0, .little); // id of last displayed banner
+        std.mem.writeInt(u32, adb[12..16], @intCast(@divTrunc(nowMs(), 1000)), .little);
+        try send(fd, SID_CHECKAD, &adb);
+        if (recvUntil(fd, SID_CHECKAD, &mb)) |ad| {
+            if (ad.len >= 16) {
+                const ad_id = std.mem.readInt(u32, ad[0..4], .little);
+                const ad_ext = std.mem.readInt(u32, ad[4..8], .little);
+                const ad_name = cstrAt(ad, 16);
+                std.debug.print("[SID_CHECKAD] adId=0x{x:0>8} ext=0x{x:0>8} file=\"{s}\" url=\"{s}\"\n", .{ ad_id, ad_ext, ad_name, cstrAt(ad, 16 + ad_name.len + 1) });
+                std.debug.print("  fetch it with: clientless bnftp --ad-id {d} --ad-ext 0x{x} {s} {s} {s}\n", .{ ad_id, ad_ext, h, product, ad_name });
+            }
+        } else |e| std.debug.print("[SID_CHECKAD] no reply ({t})\n", .{e});
 
         // ── chat-session mode (--listen): stay connected, print every chat event, and
         //    optionally talk (--say) / kick (--kick) after --delay. Drives the 2-client demo. ──

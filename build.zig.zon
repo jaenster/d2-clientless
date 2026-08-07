@@ -3,7 +3,17 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0xb9791e81f2ee2197,
-    .dependencies = .{},
+    // The game-side codecs are not this client's to own. d2-net is the D2GS wire format (the S->C
+    // opcode table, sizes and the typed packets), d2-core the item bit-stream and its
+    // ItemStatCost/ItemTypes tables, d2-util the frame header and the Huffman codec, d2-client the
+    // world model the stream describes. All of them were ported FROM here and then kept growing
+    // there, so depending on them removes forks rather than adding dependencies.
+    .dependencies = .{
+        .d2_net = .{ .path = "../libd2/packages/net" },
+        .d2_core = .{ .path = "../libd2/packages/core" },
+        .d2_util = .{ .path = "../libd2/packages/util" },
+        .d2_client = .{ .path = "../libd2/packages/client" },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
