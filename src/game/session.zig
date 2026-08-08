@@ -88,13 +88,17 @@ pub fn connectResolved(gpa: std.mem.Allocator, host: []const u8, port: u16) !Soc
 pub const JoinOptions = struct {
     host: []const u8,
     port: u16,
-    /// Resolves the game on the far side — the u16 token the realm handed out.
+    /// Resolves the game on the far side — the u16 token the realm handed out (MCP JOINGAME).
     game_id: u16,
+    /// The nGameHash the same JOINGAME reply carried. Zero for hosts that do not check it.
+    game_hash: u32 = 0,
     character: []const u8,
     /// nCharClass, as CharStats.txt orders them.
     char_class: u8 = 1,
-    /// How long to wait for the server to say it is ready for us (0x02 LoadSuccess).
+    /// How long to wait for the server to say it is ready for us.
     ready_timeout_ms: i64 = 15000,
+    /// How long to wait for the server's 0xAF greeting before sending GAMELOGON anyway.
+    greet_timeout_ms: i64 = 5000,
 };
 
 /// Told about every packet as it is applied, before the world sees it.
@@ -143,18 +147,49 @@ pub const Session = struct {
         errdefer self.deinit();
         self.world.expectLocalPlayer(opts.character);
 
+        self.awaitGreeting(opts.greet_timeout_ms);
         try self.sendGameLogon(opts);
         return self;
     }
 
-    /// GAMELOGON (0x68), 37 bytes. The token at +5 is what the far side resolves the game by.
+    /// Let the server greet first, if it is going to.
+    ///
+    /// The real engine sends its 0xAF greeting unprompted and the client answers with GAMELOGON;
+    /// a host that expects GAMELOGON first is happy either way, so waiting costs nothing and
+    /// speaking out of turn on the engine costs the whole join. After the timeout we send anyway,
+    /// which is what a real client does.
+    fn awaitGreeting(self: *Session, timeout_ms: i64) void {
+        const deadline = nowMs() + timeout_ms;
+        while (!self.greeted and nowMs() < deadline) {
+            var pfd = pollfd{ .fd = self.fd, .events = POLLIN, .revents = 0 };
+            if (poll(&pfd, 1, 50) <= 0 or (pfd.revents & POLLIN) == 0) continue;
+            const nr = read(self.fd, self.buf[self.len..].ptr, self.buf.len - self.len);
+            if (nr <= 0) return;
+            self.len += @intCast(nr);
+            if (self.len >= 2 and self.buf[0] == 0xAF) {
+                self.greeted = true;
+                std.mem.copyForwards(u8, self.buf[0 .. self.len - 2], self.buf[2..self.len]);
+                self.len -= 2;
+            }
+        }
+    }
+
+    /// GAMELOGON (0x68), 37 bytes — `D2GSPacketClt0x68`, packed and raw.
+    ///
+    /// Every field matters on the real engine even though a simpler host ignores most of them: the
+    /// hash and token identify the game the realm assigned, and the two constants are the
+    /// expansion/version pair the engine checks before it will admit anyone.
     fn sendGameLogon(self: *Session, opts: JoinOptions) !void {
         var gl: [37]u8 = [_]u8{0} ** 37;
         gl[0] = 0x68;
-        std.mem.writeInt(u16, gl[5..7], opts.game_id, .little);
-        gl[7] = opts.char_class;
-        std.mem.writeInt(u32, gl[8..12], 0x0e, .little); // nVerByte — 1.14d
-        const n = @min(opts.character.len, 15);
+        std.mem.writeInt(u32, gl[1..5], opts.game_hash, .little); // nGameHash (from JOINGAME)
+        std.mem.writeInt(u16, gl[5..7], opts.game_id, .little); // nGameToken
+        gl[7] = opts.char_class; // nCharClass
+        std.mem.writeInt(u32, gl[8..12], 0x0e, .little); // nVerByte — GetGameVersion(), 1.14d
+        std.mem.writeInt(u32, gl[12..16], 0xed5fcc50, .little); // nVersionConstant (expansion)
+        std.mem.writeInt(u32, gl[16..20], 0x91a519b6, .little); // nConstant
+        gl[20] = 0; // nLanguageCode
+        const n = @min(opts.character.len, 16);
         @memcpy(gl[21..][0..n], opts.character[0..n]);
         try writeAll(self.fd, &gl);
     }
@@ -249,10 +284,15 @@ pub const Session = struct {
             self.world.apply(pkt);
             tick.applied += 1;
 
-            // GameFlags (0x01) is `CLIENT_SendGameFlagsAndSetState1`, and the client's answer to it
-            // is ENTERGAME — that is the trigger, not LoadSuccess (0x02). 0x02 is a C->S handler,
-            // so a server that never sends one is not a server that is not ready.
-            if ((pkt[0] == 0x01 or pkt[0] == 0x02) and !self.entered) {
+            // What drives ENTERGAME is NOT GameFlags (0x01): the client's Incoming0x01_GameFlags
+            // handler only sets difficulty, expansion and UI state. `CLIENT_SendGameFlagsAndSetState1`
+            // sends GameFlags and THEN a bare StateCommand(0) — and it is that 0x00 the real client
+            // answers. The 1.14d engine additionally leads with HandShake (0x0b) and wants 0x6b
+            // before it will stream anything at all; 0x02 is kept for hosts that echo a LoadSuccess.
+            //
+            // Answering on 0x01 is one packet too early, and the engine's reply to that is not an
+            // error — it sends its game-info packets and then simply never streams the act.
+            if ((pkt[0] == 0x00 or pkt[0] == 0x02 or pkt[0] == 0x0b) and !self.entered) {
                 try writeAll(self.fd, &[_]u8{ 0x6a, 0x6b });
                 self.entered = true;
                 tick.entered_now = true;
