@@ -26,6 +26,7 @@ const bnftp = @import("bnftp");
 const packets = @import("d2-net").sc;
 const world_mod = @import("d2-client");
 const bot = @import("game/bot.zig");
+const session = @import("d2-session");
 
 // ── libc sockets (native host target; std.net/std.posix wrappers are gone in 0.16) ──
 const Socket = c_int;
@@ -625,9 +626,9 @@ fn feedStream(world: *world_mod.World, bytes: []const u8, log: bool) usize {
 // boss there. The standalone declares AF00 (compression off) and length-prefixes every packet
 // after the raw greeting (SendPacketToClient @0x52b330), so nextFrame demuxes the stream.
 fn mephSend(ctx: *anyopaque, bytes: []const u8) void {
-    const fd: *Socket = @ptrCast(@alignCast(ctx));
+    const s: *session.Session = @ptrCast(@alignCast(ctx));
     if (c_getenv("MEPH_VERBOSE") != null) std.debug.print("[meph] -> C->S 0x{x:0>2} ({d} bytes)\n", .{ bytes[0], bytes.len });
-    writeAll(fd.*, bytes) catch {};
+    s.send(bytes) catch {};
 }
 
 fn mephRun(gpa: std.mem.Allocator, hostport: ?[]const u8, gameid_arg: ?[]const u8) !void {
@@ -653,94 +654,43 @@ fn mephRun(gpa: std.mem.Allocator, hostport: ?[]const u8, gameid_arg: ?[]const u
         return;
     };
 
-    var fd = connectResolved(gpa, host, port) catch {
+    var sess = session.Session.open(gpa, .{
+        .host = host,
+        .port = port,
+        .game_id = gameid,
+        .character = "Bot",
+        .char_class = 1, // Sorceress
+    }) catch {
         std.debug.print("[meph] connect to {s}:{d} failed\n", .{ host, port });
         return;
     };
-    defer _ = close(fd);
-    // Short recv timeout so the driver ticks ~20x/sec even when the server is quiet — the bot must
-    // keep issuing run-toward-target commands to cross the level to Mephisto, not stall waiting on
-    // incoming packets (a 3s timeout made it crawl one step per 3s and never reach the boss).
-    setRecvTimeout(fd, 50);
+    defer sess.deinit();
+    sess.world.verbose = c_getenv("MEPH_VERBOSE") != null;
     std.debug.print("[meph] connected {s}:{d}, gameid={d}\n", .{ host, port, gameid });
 
-    // GAMELOGON (0x68), 37 bytes — the standalone resolves the game by the u16 token@5 (== gameid).
-    var gl: [37]u8 = [_]u8{0} ** 37;
-    gl[0] = 0x68;
-    std.mem.writeInt(u16, gl[5..7], gameid, .little); // token field == gameid (qqserver-rewrite slot)
-    gl[7] = 1; // nCharClass (Sorceress)
-    std.mem.writeInt(u32, gl[8..12], 0x0e, .little); // nVerByte (1.14d)
-    @memcpy(gl[21..][0..3], "Bot"); // szCharName
-    try writeAll(fd, &gl);
-    std.debug.print("[meph] -> GAMELOGON (0x68) gameid={d}\n", .{gameid});
+    var driver = bot.Driver{ .ctx = @ptrCast(&sess), .sendFn = &mephSend };
 
-    var world = world_mod.World.init(gpa);
-    world.verbose = c_getenv("MEPH_VERBOSE") != null;
-    defer world.deinit();
-
-    var driver = bot.Driver{ .ctx = @ptrCast(&fd), .sendFn = &mephSend };
-
-    var sbuf: [32768]u8 = undefined;
-    var slen: usize = 0;
-    var sent_enter = false;
-    var af_greeted = false; // consumed the raw 0xAF greeting; the rest of the stream is framed
-    const deadline = nowMs() + 180000;
-    while (nowMs() < deadline) {
-        var off: usize = 0;
-        while (off < slen) {
-            // The raw 0xAF <flag> greeting is UNFRAMED (2 bytes). Everything after is
-            // length-prefixed (SendPacketToClient @0x52b330). The standalone declares AF00
-            // (compression off), so inner packets are never Huffman.
-            if (!af_greeted) {
-                if (slen - off < 2) break;
-                if (sbuf[off] == 0xAF) {
-                    af_greeted = true;
-                    off += 2;
-                    continue;
-                }
-                af_greeted = true; // no greeting on this dialect — treat the stream as framed
-            }
-            const fr = frame.decode(sbuf[off..slen]) orelse break; // need more bytes
-            const pkt = fr.payload;
-            const id = pkt[0];
-            world.apply(pkt);
-            // LoadSuccess (0x02): the standalone is ready for us to enter — send the paired
-            // ping (0x6A) + ENTERGAME (0x6B); the world burst (LoadAct/CreatePlayer/monsters)
-            // follows. From then on the driver steers.
-            if (id == 0x02 and !sent_enter) {
-                try writeAll(fd, &[_]u8{ 0x6a, 0x6b });
-                sent_enter = true;
-                std.debug.print("[meph] -> ENTERGAME (0x6a ping + 0x6b)\n", .{});
-            }
-            off += fr.size;
-        }
-        if (off > 0) {
-            std.mem.copyForwards(u8, sbuf[0 .. slen - off], sbuf[off..slen]);
-            slen -= off;
-        }
-        // Drive the bot: one command per read pass keeps pace with the 25fps tick without flooding.
-        if (sent_enter and driver.step(&world) == .done) {
-            std.debug.print("[meph] run complete\n", .{});
-            world.dumpSummary();
-            return;
-        }
-
-        // Poll with a 50ms budget so the driver ticks ~20x/sec even when the server is quiet — a
-        // plain blocking read() stalled the loop (SO_RCVTIMEO wasn't driving the tick), so the bot
-        // never issued run-toward-boss commands across an idle level. poll timeout => idle tick.
-        var pfd = pollfd{ .fd = fd, .events = POLLIN, .revents = 0 };
-        const pr = poll(&pfd, 1, 50);
-        if (pr <= 0 or (pfd.revents & POLLIN) == 0) continue; // idle tick — driver already stepped
-        const nr = read(fd, sbuf[slen..].ptr, sbuf.len - slen);
-        if (nr == 0) {
-            std.debug.print("[meph] connection closed (level={d})\n", .{world.level_id});
+    // The 50ms pump budget keeps the driver ticking ~20x/sec even when the server is quiet. It has
+    // to: the bot crosses a level by re-issuing run-toward-target commands, so a loop that blocks
+    // waiting for incoming packets crawls one step per timeout and never reaches the boss.
+    const deadline = session.nowMs() + 180000;
+    while (session.nowMs() < deadline) {
+        const tick = sess.pump(50) catch break;
+        if (tick.entered_now) std.debug.print("[meph] -> ENTERGAME (0x6a ping + 0x6b)\n", .{});
+        if (tick.eof) {
+            std.debug.print("[meph] connection closed (level={d})\n", .{sess.world.level_id});
             break;
         }
-        if (nr < 0) continue; // idle/timeout tick — loop and let the driver retry
-        slen += @intCast(nr);
+        if (sess.entered and driver.step(&sess.world) == .done) {
+            std.debug.print("[meph] run complete\n", .{});
+            sess.world.dumpSummary();
+            sess.leave();
+            return;
+        }
     }
-    std.debug.print("[meph] finished (phase={s}, level={d})\n", .{ @tagName(driver.phase), world.level_id });
-    world.dumpSummary();
+    std.debug.print("[meph] finished (phase={s}, level={d})\n", .{ @tagName(driver.phase), sess.world.level_id });
+    sess.world.dumpSummary();
+    sess.leave();
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {

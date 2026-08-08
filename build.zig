@@ -22,6 +22,17 @@ pub fn build(b: *std.Build) void {
         .{ .name = "d2-client", .module = client.module("d2-client") },
     };
 
+    // ── d2-session: the socket, the stream and the world it describes. Public, because the
+    //    scripting host needs exactly this and nothing above it — forking it would put a second
+    //    copy of the framing rules somewhere they could drift. ──
+    const sess = b.addModule("d2-session", .{
+        .root_source_file = b.path("src/game/session.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &libd2,
+    });
+
     // ── clientless: BNCS auth + CD-keys + OLS login + MCP realm/char + chat/ladder +
     //    D2GS game entry. Uses libc sockets (std.net is gone in 0.16). ──
     const exe = b.addExecutable(.{
@@ -34,6 +45,7 @@ pub fn build(b: *std.Build) void {
             .imports = &libd2,
         }),
     });
+    exe.root_module.addImport("d2-session", sess);
     exe.root_module.addAnonymousImport("checkrev_core", .{ .root_source_file = b.path("src/checkrev_core.zig") });
     exe.root_module.addAnonymousImport("cdkey", .{ .root_source_file = b.path("src/cdkey.zig") });
     exe.root_module.addAnonymousImport("xsha1", .{ .root_source_file = b.path("src/xsha1.zig") });
