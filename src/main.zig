@@ -400,6 +400,7 @@ const MCP_STARTUP = 0x01;
 const MCP_CHARCREATE = 0x02;
 const MCP_CREATEGAME = 0x03;
 const MCP_JOINGAME = 0x04;
+const MCP_GAMELIST = 0x05;
 const MCP_CHARLOGON = 0x07;
 const MCP_LADDERDATA = 0x11;
 const MCP_MOTD = 0x12;
@@ -725,6 +726,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var game_arg: ?[]const u8 = null; // --game <name>: create+join the game and enter it on the GS
     var char_arg: ?[]const u8 = null; // --char <name>: which character to log on with (default: first)
     var goto_waypoint = false; // --goto-waypoint: after joining, actually walk to the level's waypoint
+    // How long to stay in the world once we are in it. 12s is generous enough for the whole
+    // world burst plus a look around; a load test wants it far shorter so games turn over fast.
+    var dwell_ms: u32 = 12000; // --dwell <sec>
     var gs_port: u16 = 4000; // GS game port (qqserver public port)
     var gs_tls = false; // --gs-tls: wrap the GS leg in TLS (Blizzard's :443 D2GS-over-TLS farm)
     var gs_host: ?[]const u8 = null; // --gs-host: override the GS IP (still use JOINGAME token/hash)
@@ -762,6 +766,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             char_arg = args.next();
         } else if (std.mem.eql(u8, a, "--goto-waypoint")) {
             goto_waypoint = true;
+        } else if (std.mem.eql(u8, a, "--dwell")) {
+            // Seconds in, milliseconds out: sub-second dwells are exactly what a load test wants,
+            // so accept a fractional value rather than forcing whole seconds.
+            const v = std.fmt.parseFloat(f64, args.next() orelse "12") catch 12;
+            dwell_ms = @intFromFloat(@max(0.0, v) * 1000.0);
         } else if (std.mem.eql(u8, a, "--gs-port")) {
             gs_port = std.fmt.parseInt(u16, args.next() orelse "4000", 10) catch 4000;
         } else if (std.mem.eql(u8, a, "--gs-tls")) {
@@ -832,6 +841,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\  --say <text>         send a chat message after entering chat
             \\  --kick <user>        /kick a user (needs channel-operator)
             \\  --listen <sec>       stay in chat reading events for N seconds
+            \\  --dwell <sec>        seconds to stay in the world before LEAVEGAME (default 12; fractions ok)
             \\
             \\connection / debug:
             \\  --port <n>           BNCS port (default 6112)
@@ -1158,6 +1168,37 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const clr = mcpRecv(mfd, MCP_CHARLOGON, &mb) catch &[_]u8{};
         const clres = if (clr.len >= 4) std.mem.readInt(u32, clr[0..4], .little) else 0xffffffff;
         std.debug.print("[MCP_CHARLOGON] \"{s}\" result=0x{x}  => {s}\n", .{ charname, clres, if (clres == 0) "logged onto char" else "failed" });
+
+        // ── MCP_GAMELIST (0x05) — the join screen's game list ──
+        // The engine asks for this the moment the join screen opens
+        // (NET_MCP_CLIENT_Send_0x05_GameList @0x44a590), so this is where it belongs: right
+        // after the character is chosen, before we create or join anything. The realm answers
+        // with ONE 0x05 packet PER GAME and closes the list with a packet whose token is -2
+        // (the engine maps that marker to result 0x33 = end-of-list), so read until it lands.
+        {
+            var glb: [8]u8 = undefined;
+            std.mem.writeInt(u16, glb[0..2], 5, .little); // request id — echoed in every reply
+            std.mem.writeInt(u32, glb[2..6], 0, .little); // difficulty filter: everything
+            glb[6] = 0; // search string: empty (no name filter)
+            try mcpSend(mfd, MCP_GAMELIST, glb[0..7]);
+            var listed: u32 = 0;
+            // A realm that never sends the terminator would hang the client, so the read is
+            // bounded: the join screen itself never shows more than a screenful anyway.
+            while (listed < 64) {
+                const g = mcpRecv(mfd, MCP_GAMELIST, &mb) catch break;
+                if (g.len < 11) break;
+                if (std.mem.readInt(u32, g[7..11], .little) == 0xFFFF_FFFE) break; // end of list
+                const gameid = std.mem.readInt(u32, g[2..6], .little);
+                const players = g[6];
+                const gn = std.mem.sliceTo(g[11..], 0);
+                const after = 11 + gn.len + 1;
+                const gd = if (after < g.len) std.mem.sliceTo(g[after..], 0) else "";
+                if (listed == 0) std.debug.print("[MCP_GAMELIST] games on the realm:\n", .{});
+                std.debug.print("  - \"{s}\" gameid={d} players={d} desc=\"{s}\"\n", .{ gn, gameid, players, gd });
+                listed += 1;
+            }
+            if (listed == 0) std.debug.print("[MCP_GAMELIST] no games on the realm\n", .{});
+        }
 
         // ── enter a GAME on the GS (clientless): CREATEGAME -> JOINGAME -> connect GS ->
         //    GAMELOGON(0x68) -> JOINGAME(0x6b) -> read the world stream. Real GS only. ──
@@ -1501,7 +1542,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                             pace();
                             try conn.wr(&[_]u8{0x6b});
                             sent6b = true;
-                            deadline = nowMs() + 12000; // give the world stream time after ENTERGAME
+                            deadline = nowMs() + @as(i64, dwell_ms); // stay in the world this long
                             std.debug.print("[GS] -> JOINGAME (0x6b)  (in response to 0x{x:0>2})\n", .{id});
                         }
                     }
@@ -1550,6 +1591,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 slen += @intCast(nr);
             }
             if (sent6b) {
+                // Leave the way a real client leaves. D2GS C->S 0x69 is LEAVEGAME (the
+                // 0x67..0x70 setup family: 0x68 GAMELOGON, 0x69 LEAVEGAME, 0x6b JOINGAME), and
+                // the server answers it with NET_IsClientAllowedToLeave -> LeaveServer, which
+                // cleans the client up there and then. Dropping the socket instead leaves the
+                // character seated until the server notices the dead connection seconds later —
+                // which is a load-test artefact, not something a real client does.
+                conn.wr(&[_]u8{0x69}) catch {};
+                std.debug.print("[GS] -> LEAVEGAME (0x69)\n", .{});
                 std.debug.print("[GS] joined: {d} packets, {d} world bytes after 0x6b  => IN GAME\n" ++
                     "[GS] world: act={d} level={d} mapSeed=0x{x:0>8} units={d}\n", .{ pkt_count, world_bytes, world.act, world.level_id, world.map_seed, world.unitCount() });
                 if (world.waypoint() catch null) |wp| {
