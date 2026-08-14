@@ -4,7 +4,8 @@ FROM --platform=$BUILDPLATFORM alpine:3.20 AS build
 ARG BUILDARCH
 ARG TARGETARCH
 ARG ZIG_VERSION=0.16.0
-RUN apk add --no-cache curl xz tar
+# ca-certificates so `zig build` can fetch the libd2 dependency over git+https.
+RUN apk add --no-cache curl xz tar ca-certificates
 # Zig for the build host's arch.
 RUN set -eux; \
     case "$BUILDARCH" in amd64) ZA=x86_64;; arm64) ZA=aarch64;; *) echo "unsupported build arch $BUILDARCH"; exit 1;; esac; \
@@ -12,7 +13,7 @@ RUN set -eux; \
     mkdir -p /opt/zig; tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
     ln -s /opt/zig/zig /usr/local/bin/zig; zig version
 WORKDIR /src
-COPY build.zig ./
+COPY build.zig build.zig.zon ./
 COPY src ./src
 # Cross-compile to the target arch, statically linked against musl.
 RUN set -eux; \

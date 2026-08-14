@@ -8,11 +8,16 @@
     // ItemStatCost/ItemTypes tables, d2-util the frame header and the Huffman codec, d2-client the
     // world model the stream describes. All of them were ported FROM here and then kept growing
     // there, so depending on them removes forks rather than adding dependencies.
+    //
+    // Pinned to the published libd2 rather than a sibling checkout: this repo is fetched by URL
+    // (the BNFTP poller) and built from a bare clone in CI and in the Dockerfile, neither of which
+    // has a `../libd2` to point at. Bumping libd2 here is a deliberate commit, not a side effect
+    // of whatever happens to be checked out next door.
     .dependencies = .{
-        .d2_net = .{ .path = "../libd2/packages/net" },
-        .d2_core = .{ .path = "../libd2/packages/core" },
-        .d2_util = .{ .path = "../libd2/packages/util" },
-        .d2_client = .{ .path = "../libd2/packages/client" },
+        .libd2 = .{
+            .url = "git+https://github.com/jaenster/libd2?ref=v0.6.2#a053e4c7730e56b6394ea11f1758c3d925c55e10",
+            .hash = "libd2-0.6.2-wboU7SHEogEpJA80W-hJEq9SdHdSDHMFu5AHl03ZNlV8",
+        },
     },
     .paths = .{
         "build.zig",

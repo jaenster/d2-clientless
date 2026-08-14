@@ -16,17 +16,21 @@
 //! no account, no SRP, no login. Usage:
 //!   zig build checkrev-probe -- <host> [product] [gameVersion] [--sig0]
 const std = @import("std");
-const core = @import("checkrev_core");
-const cdkey = @import("cdkey");
-const xsha1 = @import("xsha1");
-const util = @import("d2-util");
+const core = @import("libd2").bnet.checkrev;
+const cdkey = @import("libd2").bnet.cdkey;
+const xsha1 = @import("libd2").bnet.xsha1;
+const util = @import("libd2").util;
 const huffman = util.huffman;
 const frame = util.frame;
 const bnftp = @import("bnftp");
-const packets = @import("d2-net").sc;
-const world_mod = @import("d2-client");
+const packets = @import("libd2").net.sc;
+const world_mod = @import("libd2").client;
 const bot = @import("game/bot.zig");
 const session = @import("d2-session");
+const realm = @import("d2-realm");
+
+extern "c" fn usleep(usec: c_uint) c_int;
+const c_usleep = usleep;
 
 // ── libc sockets (native host target; std.net/std.posix wrappers are gone in 0.16) ──
 const Socket = c_int;
@@ -495,11 +499,6 @@ fn mcpRecv(fd: Socket, want: u8, out: []u8) ![]const u8 {
     }
 }
 
-fn lower(s: []const u8, buf: []u8) []const u8 {
-    for (s, 0..) |c, i| buf[i] = std.ascii.toLower(c);
-    return buf[0..s.len];
-}
-
 fn hexVal(c: u8) ?u8 {
     return switch (c) {
         '0'...'9' => c - '0',
@@ -694,6 +693,146 @@ fn mephRun(gpa: std.mem.Allocator, hostport: ?[]const u8, gameid_arg: ?[]const u
     sess.leave();
 }
 
+/// One character playing several games back to back on a single realm login.
+///
+/// A process per game — which is how the stress script drove this — cannot reach what a returning
+/// client leaves behind: the realm's record of which game the character is in, the engine's seat
+/// for that character, and the game itself once the last player walks out of it. Those only surface
+/// when the SAME connection and the SAME character come round again, which is what a real client
+/// and a bot both do all evening.
+const Plan = struct {
+    host: []const u8,
+    bnet_port: u16,
+    product: []const u8,
+    game_ver: []const u8,
+    keys: ?[]const u8,
+    sig_ok: u8,
+    force_checkrev: bool,
+    account: []const u8,
+    password: []const u8,
+    character: ?[]const u8,
+    /// Game name, or its stem when each run makes its own.
+    game: []const u8,
+    runs: u32,
+    dwell_ms: u32,
+    gs_host: ?[]const u8,
+    gs_port: u16,
+    /// Re-enter the SAME game every run rather than making a new one — the rejoin case.
+    same_game: bool,
+    /// Wall-clock instant (unix ms) every client of a test begins its first run at, so several
+    /// of them race the same create and the same join. Null starts as soon as the logon is done.
+    start_at_ms: ?i64,
+    /// How far apart the runs are pinned when there is a start instant. It has to cover a whole
+    /// game — enter, dwell, leave — or the clients slide a run apart and stop racing.
+    period_ms: u32,
+};
+
+fn playRuns(gpa: std.mem.Allocator, plan: Plan) !void {
+    var r = try realm.Realm.connect(gpa, .{
+        .host = plan.host,
+        .port = plan.bnet_port,
+        .product = plan.product,
+        .game_version = plan.game_ver,
+        .keys = plan.keys,
+        .sig_ok = plan.sig_ok,
+        .force_checkrev = plan.force_checkrev,
+        .verbose = verbose,
+    });
+    defer r.deinit();
+    try r.login(plan.account, plan.password);
+    try r.enterRealm(null);
+    const who = try r.chooseCharacter(plan.character);
+
+    var entered: u32 = 0;
+    var run: u32 = 1;
+    while (run <= plan.runs) : (run += 1) {
+        // The engine takes 15 characters of game name and the realm indexes what it is given, so a
+        // long stem plus a run number would silently name a different game than it joined.
+        var namebuf: [16]u8 = undefined;
+        const name = if (plan.same_game) plan.game[0..@min(plan.game.len, namebuf.len - 1)] else blk: {
+            const stem = plan.game[0..@min(plan.game.len, namebuf.len - 4)];
+            break :blk std.fmt.bufPrint(&namebuf, "{s}{d}", .{ stem, run }) catch plan.game;
+        };
+
+        // Every client of a test that was given the same instant starts run 1 together, and each
+        // run after it on the same cadence. Racing several clients into one game is otherwise not
+        // something a shell can arrange: they are already past their realm logon by different
+        // amounts, so "start them at once" lands the joins hundreds of milliseconds apart and the
+        // create/join race is never actually run.
+        if (plan.start_at_ms) |at| {
+            const due = at + @as(i64, run - 1) * @as(i64, plan.period_ms);
+            while (session.nowMs() < due) _ = c_usleep(1000);
+        }
+
+        const t0 = session.nowMs();
+        // A create that fails is not the end of the run: the game may already be up, made by
+        // another client of the same test or left behind by the run before. JOINGAME is what
+        // decides, and it says why.
+        const made = r.createGame(.{ .name = name }) catch |e| {
+            std.debug.print("[run {d}/{d}] \"{s}\" CREATEGAME failed: {s}\n", .{ run, plan.runs, name, @errorName(e) });
+            continue;
+        };
+        const ticket = r.joinGame(name, "") catch |e| {
+            std.debug.print("[run {d}/{d}] \"{s}\" JOINGAME failed: {s} (create said {s})\n", .{
+                run, plan.runs, name, @errorName(e), made.describe(),
+            });
+            continue;
+        };
+
+        var s = session.Session.open(gpa, .{
+            .host = plan.gs_host orelse ticket.gsHost(),
+            .port = plan.gs_port,
+            .game_id = ticket.token,
+            .game_hash = ticket.hash,
+            .character = who.name(),
+            .char_class = who.class,
+        }) catch |e| {
+            std.debug.print("[run {d}/{d}] \"{s}\" GS connect failed: {s}\n", .{ run, plan.runs, name, @errorName(e) });
+            continue;
+        };
+        defer s.deinit();
+
+        s.waitUntilInGame(15000) catch |e| {
+            // The server usually says why before it hangs up. Report THAT, not the hang-up.
+            if (s.refused) |said| {
+                std.debug.print("[run {d}/{d}] \"{s}\" token={d} REFUSED: {s}\n", .{ run, plan.runs, name, ticket.token, said.describe() });
+            } else std.debug.print("[run {d}/{d}] \"{s}\" token={d} NEVER ENTERED: {s} (entered={} seed=0x{x} resynced={d})\n", .{
+                run, plan.runs, name, ticket.token, @errorName(e), s.entered, s.world.map_seed, s.resynced,
+            });
+            s.leave();
+            continue;
+        };
+        entered += 1;
+        // Same shape as the single-game path prints, so one reader counts both.
+        std.debug.print("[run {d}/{d}] \"{s}\" token={d} entered in {d}ms\n" ++
+            "[GS] world: act={d} level={d} mapSeed=0x{x:0>8} units={d}\n", .{
+            run,       plan.runs,      name,           ticket.token, session.nowMs() - t0,
+            s.world.act, s.world.level_id, s.world.map_seed, s.world.unitCount(),
+        });
+
+        // Stay in the world the way a player does — pumping, so the keep-alive goes out and the
+        // world keeps being applied. A client that goes quiet is dropped by the engine, and that
+        // looks exactly like the server ending the game.
+        const until = session.nowMs() + @as(i64, plan.dwell_ms);
+        var dropped = false;
+        while (session.nowMs() < until) {
+            const tick = s.pump(50) catch break;
+            if (tick.eof) {
+                dropped = true;
+                break;
+            }
+        }
+        if (dropped) {
+            std.debug.print("[run {d}/{d}] \"{s}\" the GS closed the connection while we were in it\n", .{ run, plan.runs, name });
+            continue;
+        }
+        s.leave();
+    }
+
+    std.debug.print("[runs] {d}/{d} entered as \"{s}\"\n", .{ entered, plan.runs, who.name() });
+    if (entered < plan.runs) return error.RunsFailed;
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = std.heap.page_allocator;
 
@@ -740,6 +879,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var ver_byte: u8 = 0x0e; // GAMELOGON nVerByte — GET_GameVersion() returns 0xe (14) for 1.14d
     var bnet_port: u16 = 6112; // BNCS port to connect to (--port)
     var force_checkrev = false; // --force-checkrev: respond even if the MPQ isn't the one we implement
+    // --runs <n>: play n games back to back on ONE login, leaving each properly before the next.
+    // Distinct game names unless --same-game, which makes every run re-enter the same one.
+    var runs: u32 = 0;
+    var same_game = false;
+    // --at <unix-ms>[:<period-ms>]: all clients of a test start run 1 at the same instant, and
+    // each later run one period on, so concurrent joins are actually concurrent.
+    var start_at_ms: ?i64 = null;
+    var period_ms: u32 = 3000;
     var pos: usize = 0;
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--sig0")) {
@@ -794,6 +941,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
             bnet_port = std.fmt.parseInt(u16, args.next() orelse "6112", 10) catch 6112;
         } else if (std.mem.eql(u8, a, "--delay")) {
             step_delay_ms = std.fmt.parseInt(u64, args.next() orelse "0", 10) catch 0;
+        } else if (std.mem.eql(u8, a, "--runs")) {
+            runs = std.fmt.parseInt(u32, args.next() orelse "1", 10) catch 1;
+        } else if (std.mem.eql(u8, a, "--same-game")) {
+            same_game = true;
+        } else if (std.mem.eql(u8, a, "--at")) {
+            const spec = args.next() orelse "";
+            const cut = std.mem.indexOfScalar(u8, spec, ':') orelse spec.len;
+            start_at_ms = std.fmt.parseInt(i64, spec[0..cut], 10) catch null;
+            if (cut < spec.len) period_ms = std.fmt.parseInt(u32, spec[cut + 1 ..], 10) catch period_ms;
         } else if (std.mem.eql(u8, a, "--force-checkrev")) {
             force_checkrev = true;
         } else if (std.mem.eql(u8, a, "--verbose")) {
@@ -867,6 +1023,36 @@ pub fn main(init: std.process.Init.Minimal) !void {
         , .{});
         return;
     };
+
+    // --runs takes the whole session: it owns the realm connection for the length of several
+    // games, which the single-shot path below cannot express.
+    if (runs > 0) {
+        const la = login_arg orelse {
+            std.debug.print("--runs needs --login acct:pw\n", .{});
+            return;
+        };
+        const sep = std.mem.indexOfScalar(u8, la, ':') orelse la.len;
+        return playRuns(gpa, .{
+            .host = h,
+            .bnet_port = bnet_port,
+            .product = product,
+            .game_ver = game_ver,
+            .keys = keys_arg,
+            .sig_ok = sig_ok,
+            .force_checkrev = force_checkrev,
+            .account = la[0..sep],
+            .password = if (sep < la.len) la[sep + 1 ..] else "",
+            .character = char_arg,
+            .game = game_arg orelse "runs",
+            .runs = runs,
+            .dwell_ms = dwell_ms,
+            .gs_host = gs_host,
+            .gs_port = gs_port,
+            .same_game = same_game,
+            .start_at_ms = start_at_ms,
+            .period_ms = period_ms,
+        });
+    }
 
     std.debug.print("== {s}:{d}  product={s}  gameVer={s}  sigOk={d} ==\n", .{ h, bnet_port, product, game_ver, sig_ok });
     const fd = try connectResolved(gpa, h, bnet_port);
@@ -974,8 +1160,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const sep = std.mem.indexOfScalar(u8, ca, ':') orelse ca.len;
         const acct = ca[0..sep];
         const pass = if (sep < ca.len) ca[sep + 1 ..] else "";
-        var lb: [64]u8 = undefined;
-        const pwhash = xsha1.xsha1(lower(pass, &lb)); // single hash for CREATE (login uses double)
+        const pwhash = xsha1.passwordHash(pass); // single hash for CREATE (login uses double)
         var nb: [320]u8 = undefined;
         @memcpy(nb[0..20], &pwhash);
         @memcpy(nb[20 .. 20 + acct.len], acct);
@@ -993,8 +1178,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const sep = std.mem.indexOfScalar(u8, la, ':') orelse la.len;
         const acct = la[0..sep];
         const pass = if (sep < la.len) la[sep + 1 ..] else "";
-        var lb: [64]u8 = undefined;
-        const inner = xsha1.xsha1(lower(pass, &lb)); // xsha1(lowercase(password))
+        const inner = xsha1.passwordHash(pass);
         const pwhash = xsha1.doubleHash(CLIENT_TOKEN, stoken, inner);
         var pb: [320]u8 = undefined;
         std.mem.writeInt(u32, pb[0..4], CLIENT_TOKEN, .little);

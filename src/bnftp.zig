@@ -20,6 +20,7 @@
 //!         --proto-ver 0xNNNN (BNFTP version, default 0x0100)
 //!   product: 4CC, default D2XP (LoD). Use D2DV for classic.
 const std = @import("std");
+const wire = @import("libd2").bnet.bnftp;
 
 // ── libc sockets (native host target; std.posix socket wrappers are gone in 0.16) ──
 const Socket = c_int;
@@ -314,11 +315,14 @@ pub fn fetch(
     }
     if (total < 8) return gpa.alloc(u8, 0); // no header at all -> treat as not hosted
 
-    const hlen = std.mem.readInt(u32, reply[0..4], .little);
-    const fsize = std.mem.readInt(u32, reply[4..8], .little);
-    if (fsize == 0) return gpa.alloc(u8, 0); // server reports the file as not hosted
-    if (hlen < 0x18) return error.BnftpBadHeader;
-    const need: usize = @as(usize, hlen) + fsize;
+    const hdr = wire.ReplyHeader.decode(reply[0..total]) catch |e| return switch (e) {
+        wire.Error.BadHeaderLen => error.BnftpBadHeader,
+        else => error.BnftpTruncated,
+    };
+    if (hdr.notHosted()) return gpa.alloc(u8, 0); // the server does not have this file
+    const hlen = hdr.header_len;
+    const fsize = hdr.file_size;
+    const need = hdr.totalLen();
     if (need > cap) return error.BnftpReplyTooLarge;
 
     while (total < need) {
@@ -375,27 +379,14 @@ fn headProbe(
 
 /// Serialize a BNFTPv1 request header into `buf`; returns its length.
 fn buildRequest(buf: []u8, product: []const u8, filename: []const u8, opts: FetchOpts) usize {
-    var w: usize = 2; // [0x00] reqLen u16, filled at the end
-    std.mem.writeInt(u16, buf[w..][0..2], opts.proto_ver, .little);
-    w += 2;
-    std.mem.writeInt(u32, buf[w..][0..4], fourcc("IX86"), .little);
-    w += 4;
-    std.mem.writeInt(u32, buf[w..][0..4], fourcc(product), .little);
-    w += 4;
-    std.mem.writeInt(u32, buf[w..][0..4], opts.banner_id, .little);
-    w += 4;
-    std.mem.writeInt(u32, buf[w..][0..4], opts.banner_ext, .little);
-    w += 4;
-    std.mem.writeInt(u32, buf[w..][0..4], 0, .little);
-    w += 4; // startPos
-    std.mem.writeInt(u64, buf[w..][0..8], 0, .little);
-    w += 8; // local filetime
-    @memcpy(buf[w..][0..filename.len], filename);
-    w += filename.len;
-    buf[w] = 0;
-    w += 1;
-    std.mem.writeInt(u16, buf[0..2], @intCast(w), .little);
-    return w;
+    const req = (wire.Request{
+        .protocol_ver = opts.proto_ver,
+        .product = wire.fourcc(product),
+        .banner_id = opts.banner_id,
+        .banner_ext = opts.banner_ext,
+        .filename = filename,
+    }).encode(buf) catch return 0;
+    return req.len;
 }
 
 /// Print a dword the way it sits on the wire (4CCs are stored reversed).

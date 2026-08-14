@@ -11,15 +11,21 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const net = b.dependency("d2_net", .{ .target = target, .optimize = optimize });
-    const core = b.dependency("d2_core", .{ .target = target, .optimize = optimize });
-    const util = b.dependency("d2_util", .{ .target = target, .optimize = optimize });
-    const client = b.dependency("d2_client", .{ .target = target, .optimize = optimize });
+    // The libc socket layer, shared by the session and the realm legs. It is a module rather than
+    // a relative import because a file may belong to exactly one module, and both legs need it.
+    const sockets = b.addModule("d2-net-socket", .{
+        .root_source_file = b.path("src/game/net.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    // One dependency on libd2, and one import from it: the library re-exports every layer off a
+    // single `libd2` module, so this list does not have to be kept in step with the library's own
+    // layering, and naming a layer costs nothing until it is used.
+    const d2 = b.dependency("libd2", .{ .target = target, .optimize = optimize });
     const libd2 = [_]std.Build.Module.Import{
-        .{ .name = "d2-net", .module = net.module("d2-net") },
-        .{ .name = "d2-core", .module = core.module("d2-core") },
-        .{ .name = "d2-util", .module = util.module("d2-util") },
-        .{ .name = "d2-client", .module = client.module("d2-client") },
+        .{ .name = "libd2", .module = d2.module("libd2") },
     };
 
     // ── d2-session: the socket, the stream and the world it describes. Public, because the
@@ -32,6 +38,20 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &libd2,
     });
+    sess.addImport("d2-net-socket", sockets);
+
+    // ── d2-realm: BNCS auth -> realm logon -> MCP character -> a game to dial. Public for the
+    //    same reason as d2-session: a bot that has to get itself into a game needs this leg, and
+    //    a second copy of the MCP order (STARTUP -> CHARLIST2 -> CHARLOGON, no MOTD) is a bug
+    //    waiting to be reintroduced. ──
+    const realm = b.addModule("d2-realm", .{
+        .root_source_file = b.path("src/game/realm.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &libd2,
+    });
+    realm.addImport("d2-net-socket", sockets);
 
     // ── clientless: BNCS auth + CD-keys + OLS login + MCP realm/char + chat/ladder +
     //    D2GS game entry. Uses libc sockets (std.net is gone in 0.16). ──
@@ -46,17 +66,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("d2-session", sess);
-    exe.root_module.addAnonymousImport("checkrev_core", .{ .root_source_file = b.path("src/checkrev_core.zig") });
-    exe.root_module.addAnonymousImport("cdkey", .{ .root_source_file = b.path("src/cdkey.zig") });
-    exe.root_module.addAnonymousImport("xsha1", .{ .root_source_file = b.path("src/xsha1.zig") });
-    // BNFTP is folded into the one binary as the `bnftp` subcommand (it only needs std);
+    exe.root_module.addImport("d2-realm", realm);
+    // BNFTP is folded into the one binary as the `bnftp` subcommand; the wire format itself
+    // comes from libd2 (shared with the realm server that answers it), and what is here is the
+    // socket work and the CLI.
     // main.zig's dispatcher hands off to it.
-    exe.root_module.addAnonymousImport("bnftp", .{ .root_source_file = b.path("src/bnftp.zig") });
+    const bnftp_mod = b.addModule("bnftp", .{
+        .root_source_file = b.path("src/bnftp.zig"),
+        .imports = &libd2,
+    });
+    exe.root_module.addImport("bnftp", bnftp_mod);
     b.installArtifact(exe);
 
     // Expose the BNFTP fetch logic as a public module so downstream packages can
     // `@import("bnftp")` and call `bnftp.fetch(...)` (e.g. the re-fetch poller).
-    _ = b.addModule("bnftp", .{ .root_source_file = b.path("src/bnftp.zig") });
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
@@ -70,10 +93,10 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bnftp.addArgs(args);
     b.step("bnftp", "Run the BNFTP file client (clientless bnftp ...)").dependOn(&run_bnftp.step);
 
-    // ── crypto unit tests: standard SHA-1 (CheckRevision), WC3 26-char CD-key decode,
-    //    Blizzard broken SHA-1 (OLS password) — each module carries its own `test`s. ──
-    const test_step = b.step("test", "Run the crypto unit tests");
-    for ([_][]const u8{ "src/checkrev_core.zig", "src/cdkey.zig", "src/xsha1.zig", "src/game/bot.zig" }) |path| {
+    // The crypto vectors moved to libd2's d2-bnet with the code they verify; what is left to
+    // test here is this repo's own logic.
+    const test_step = b.step("test", "Run the unit tests");
+    for ([_][]const u8{"src/game/bot.zig"}) |path| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),
@@ -84,4 +107,6 @@ pub fn build(b: *std.Build) void {
         });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = realm })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sess })).step);
 }

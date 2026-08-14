@@ -15,70 +15,27 @@
 //! get a stream that decodes for ten packets and then desyncs.
 
 const std = @import("std");
-const sc = @import("d2-net").sc;
-const client = @import("d2-client");
+const sc = @import("libd2").net.sc;
+const cs = @import("libd2").net.cs;
+const client = @import("libd2").client;
 const World = client.World;
 const Actor = client.Actor;
 
-// ── libc sockets. std.net is gone in 0.16, and this is the one place that needs them. ──
-pub const Socket = c_int;
-extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
-extern "c" fn connect(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
-extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
-extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn setsockopt(fd: c_int, level: c_int, optname: c_int, optval: *const anyopaque, optlen: c_uint) c_int;
-extern "c" fn gettimeofday(tv: *std.posix.timeval, tz: ?*anyopaque) c_int;
-const SOCK_STREAM: c_int = 1;
+const net = @import("d2-net-socket");
 
-pub const POLLIN: i16 = 0x0001;
-pub const pollfd = extern struct { fd: c_int, events: i16, revents: i16 };
-pub extern "c" fn poll(fds: *pollfd, nfds: c_uint, timeout: c_int) c_int;
+// The socket layer is shared with the realm leg — one connect, one timeout policy, one place to
+// change them. Re-exported because callers of a session shouldn't need to know it exists.
+pub const Socket = net.Socket;
+pub const POLLIN = net.POLLIN;
+pub const pollfd = net.pollfd;
+pub const poll = net.poll;
+pub const setRecvTimeout = net.setRecvTimeout;
+pub const nowMs = net.nowMs;
+pub const writeAll = net.writeAll;
+pub const connectResolved = net.connectResolved;
 
-pub fn setRecvTimeout(fd: Socket, ms: u32) void {
-    const tv = std.posix.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
-    _ = setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &tv, @sizeOf(std.posix.timeval));
-}
-
-pub fn nowMs() i64 {
-    var tv: std.posix.timeval = undefined;
-    _ = gettimeofday(&tv, null);
-    return @as(i64, @intCast(tv.sec)) * 1000 + @divTrunc(@as(i64, @intCast(tv.usec)), 1000);
-}
-
-pub fn writeAll(fd: Socket, buf: []const u8) !void {
-    var sent: usize = 0;
-    while (sent < buf.len) {
-        const n = write(fd, buf.ptr + sent, buf.len - sent);
-        if (n <= 0) return error.WriteFailed;
-        sent += @intCast(n);
-    }
-}
-
-pub fn connectResolved(gpa: std.mem.Allocator, host: []const u8, port: u16) !Socket {
-    const chost = try gpa.dupeZ(u8, host);
-    defer gpa.free(chost);
-    var pbuf: [8]u8 = undefined;
-    const cserv = std.fmt.bufPrintZ(&pbuf, "{d}", .{port}) catch unreachable;
-    var hints = std.mem.zeroes(std.c.addrinfo);
-    hints.family = 0; // AF_UNSPEC
-    hints.socktype = SOCK_STREAM;
-    var res: ?*std.c.addrinfo = null;
-    if (@intFromEnum(std.c.getaddrinfo(chost.ptr, cserv.ptr, &hints, &res)) != 0) return error.ResolveFailed;
-    defer if (res) |r| std.c.freeaddrinfo(r);
-    var ai = res;
-    while (ai) |a| : (ai = a.next) {
-        const sa = a.addr orelse continue;
-        const fd = socket(a.family, SOCK_STREAM, 0);
-        if (fd < 0) continue;
-        if (connect(fd, sa, a.addrlen) == 0) {
-            setRecvTimeout(fd, 20000);
-            return fd;
-        }
-        _ = close(fd);
-    }
-    return error.ConnectFailed;
-}
+const read = net.read;
+const close = net.close;
 
 /// Where to join, and as whom.
 ///
@@ -107,6 +64,26 @@ pub const Observer = struct {
     on_packet: *const fn (ctx: *anyopaque, packet: []const u8) void,
 };
 
+/// A server-sent end to the connection. `ConnectionTerminated` (0xB0) carries nothing — the
+/// engine sends it when it could not seat the client, a full game being the ordinary reason.
+/// `ConnectionRefused` (0xB4) carries a load-error code.
+pub const Refusal = struct {
+    pub const TERMINATED: u8 = 0xB0;
+    pub const REFUSED: u8 = 0xB4;
+
+    opcode: u8,
+    reason: u32 = 0,
+
+    pub fn describe(self: Refusal) []const u8 {
+        if (self.opcode == TERMINATED) return "the server could not seat us (0xB0; the game is full, or it would not take another client)";
+        return switch (self.reason) {
+            0x13, 0x14, 0x15 => "hardcore (0xB4)",
+            0x17, 0x18 => "expansion mismatch (0xB4)",
+            else => "the server refused the character (0xB4)",
+        };
+    }
+};
+
 pub const Session = struct {
     gpa: std.mem.Allocator,
     fd: Socket,
@@ -118,8 +95,22 @@ pub const Session = struct {
     len: usize = 0,
     /// The unframed 2-byte 0xAF greeting has been consumed; everything after it is framed.
     greeted: bool = false,
+    /// Bytes skipped across the whole session because no opcode framed there. Non-zero means the
+    /// S->C stream desynced and everything after it is guesswork.
+    resynced: u32 = 0,
     /// The server has streamed LoadSuccess and we have answered with ENTERGAME.
     entered: bool = false,
+    /// The server said it was ending this connection, and why.
+    ///
+    /// Worth keeping, because the alternative is reporting every one of these as "disconnected".
+    /// A game with no room left for another client answers 0xB0 and hangs up — one byte, easy to
+    /// read as noise — and a character the server will not load answers 0xB4 with the reason in
+    /// it. Both look exactly like a socket that died on its own if nobody writes them down, and
+    /// "the connection dropped" sends you looking at the network for an answer the server already
+    /// gave you.
+    refused: ?Refusal = null,
+    /// When the next keep-alive ping is due.
+    next_ping: i64 = 0,
     closed: bool = false,
 
     pub const Error = error{
@@ -219,16 +210,64 @@ pub const Session = struct {
     /// leaves the character in the game as far as the server is concerned, and the NEXT join for
     /// that character is then accepted and streamed nothing — a silent failure that looks exactly
     /// like a broken world load, and one that costs an afternoon to recognise the second time.
+    /// How long to keep reading after LEAVEGAME before giving up on the server's own hang-up.
+    pub const LEAVE_GRACE_MS: i64 = 1000;
+
     pub fn leave(self: *Session) void {
         if (self.closed) return;
         writeAll(self.fd, &[_]u8{0x69}) catch {};
+        // Then WAIT for the server to hang up. Sending the byte and closing in the same breath
+        // races the engine: it sees the dead socket first and takes its dropped-connection path
+        // instead, which leaves the character seated in the game it just left. The next join for
+        // that character then has to evict it, and if that eviction loses its own race the join is
+        // refused with nothing said. The server closes as soon as it has torn us down, so reading
+        // to EOF is both the acknowledgement and the wait.
+        const deadline = nowMs() + LEAVE_GRACE_MS;
+        var sink: [512]u8 = undefined;
+        while (nowMs() < deadline) {
+            var pfd = pollfd{ .fd = self.fd, .events = POLLIN, .revents = 0 };
+            if (poll(&pfd, 1, 50) <= 0) continue;
+            if (read(self.fd, &sink, sink.len) <= 0) break; // EOF: torn down
+        }
         _ = close(self.fd);
         self.closed = true;
+    }
+
+    /// How often to ping. The engine drops a connection that goes quiet.
+    pub const PING_INTERVAL_MS: i64 = 2000;
+
+    /// SCMD 0x6d — the client keep-alive. Thirteen bytes: opcode, a tick count, and eight zeros.
+    ///
+    /// Session-layer, like GAMELOGON and ENTERGAME: it is not in the server's command dispatch
+    /// table, which is exactly why a client that only ever sends game commands looks idle. The
+    /// engine hangs up on a connection that stops pinging, and it does so without saying anything,
+    /// so the symptom is a socket that simply closes.
+    ///
+    /// The LENGTH is the part that has to be exact. The server frames C->S by the same size table
+    /// the client does, so a short 0x6d does not get rejected — it gets sized at 13 anyway, eating
+    /// the eight bytes that follow it. Every command after the first ping is then read at an offset,
+    /// and the game goes silent rather than erroring. `PING_SIZE` is asserted against the engine's
+    /// own table below so it cannot drift back.
+    const PING_SIZE = 13;
+
+    fn ping(self: *Session) void {
+        var buf: [PING_SIZE]u8 = [_]u8{0} ** PING_SIZE;
+        buf[0] = 0x6d;
+        std.mem.writeInt(u32, buf[1..5], @truncate(@as(u64, @bitCast(nowMs()))), .little);
+        writeAll(self.fd, &buf) catch {};
+        self.next_ping = nowMs() + PING_INTERVAL_MS;
     }
 
     pub const Tick = struct {
         /// Packets applied to the world this tick.
         applied: u32 = 0,
+        /// Bytes skipped because no opcode framed there.
+        ///
+        /// A desync has no error to report — the stream simply stops meaning anything, and the
+        /// world model quietly stops being updated while every command we send is computed from
+        /// the last position we understood. Counting the skips is the only way to tell that apart
+        /// from a character that genuinely will not move.
+        resynced: u32 = 0,
         /// The server said it is ready and we answered — the world burst follows.
         entered_now: bool = false,
         /// The peer hung up.
@@ -243,6 +282,8 @@ pub const Session = struct {
             tick.eof = true;
             return tick;
         }
+
+        if (nowMs() >= self.next_ping) self.ping();
 
         var pfd = pollfd{ .fd = self.fd, .events = POLLIN, .revents = 0 };
         const pr = poll(&pfd, 1, budget_ms);
@@ -276,6 +317,8 @@ pub const Session = struct {
                 // An opcode the size table does not know. There is no length to skip by, so the
                 // rest of this read is unreadable; resync a byte rather than pretending.
                 off += 1;
+                tick.resynced += 1;
+                self.resynced +|= 1;
                 continue;
             }
             if (off + n > self.len) break; // whole packet not here yet
@@ -283,6 +326,9 @@ pub const Session = struct {
             if (self.observer) |o| o.on_packet(o.ctx, pkt);
             self.world.apply(pkt);
             tick.applied += 1;
+            if (pkt[0] == Refusal.TERMINATED) self.refused = .{ .opcode = pkt[0] };
+            if (pkt[0] == Refusal.REFUSED and pkt.len >= 5)
+                self.refused = .{ .opcode = pkt[0], .reason = std.mem.readInt(u32, pkt[1..5], .little) };
 
             // What drives ENTERGAME is NOT GameFlags (0x01): the client's Incoming0x01_GameFlags
             // handler only sets difficulty, expansion and UI state. `CLIENT_SendGameFlagsAndSetState1`
@@ -293,6 +339,11 @@ pub const Session = struct {
             // Answering on 0x01 is one packet too early, and the engine's reply to that is not an
             // error — it sends its game-info packets and then simply never streams the act.
             if ((pkt[0] == 0x00 or pkt[0] == 0x02 or pkt[0] == 0x0b) and !self.entered) {
+                // 0x6A then 0x6B. The engine's own client never sends 0x6A
+                // (`NET_D2GS_CLIENT_Send_0x6A` @0x478010 has no callers) and the ping is 0x6D, so
+                // the "0x6A = ping" label this carried is wrong — but dropping it stopped the world
+                // from streaming here, and an unexplained-but-working handshake beats a tidy one
+                // that hangs. Left in place until something explains what the GS does with it.
                 try writeAll(self.fd, &[_]u8{ 0x6a, 0x6b });
                 self.entered = true;
                 tick.entered_now = true;
@@ -307,13 +358,34 @@ pub const Session = struct {
     }
 
     /// Pump until we are in the game and the act has streamed, or give up.
+    ///
+    /// "In the game" is not "our character exists". The server names the player before it says
+    /// where the player IS: CreatePlayer arrives first, LoadAct with the level and the map seed
+    /// after it. Returning on the first of those hands the caller an area of 0 and a seed of 0,
+    /// and anything that generates the world from that seed generates the wrong world — silently,
+    /// because zero is a perfectly valid-looking seed.
+    ///
+    /// A non-zero map seed is what says LoadAct has been seen; nothing else sets it. The position
+    /// is the last of the three to arrive, and it matters for the same reason: a route planned
+    /// from (0,0) is a route from the corner of the map.
     pub fn waitUntilInGame(self: *Session, timeout_ms: i64) !void {
         const deadline = nowMs() + timeout_ms;
         while (nowMs() < deadline) {
             const tick = try self.pump(50);
             if (tick.eof) return Error.Disconnected;
-            if (self.entered and self.world.local_player_guid != null) return;
+            if (!self.entered or self.world.local_player_guid == null) continue;
+            if (!(self.world.loaded or self.world.map_seed != 0)) continue;
+            const at = self.world.playerPos() orelse continue;
+            if (at.x != 0 or at.y != 0) return;
         }
         return Error.NeverReady;
     }
 };
+
+test "the keep-alive is the size the engine's own C->S table says it is" {
+    // A short ping is not rejected, it is misframed — the eight bytes after it are swallowed as
+    // part of the packet and every command from then on is read at an offset.
+    try std.testing.expectEqual(@as(usize, Session.PING_SIZE), cs.sizeOf(&[_]u8{0x6d} ** 16).?);
+    try std.testing.expectEqual(@as(usize, 37), cs.sizeOf(&[_]u8{0x68} ** 40).?);
+    try std.testing.expectEqual(@as(usize, 1), cs.sizeOf(&[_]u8{0x69}).?); // leave
+}

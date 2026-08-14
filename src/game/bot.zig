@@ -25,8 +25,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const world_mod = @import("d2-client");
-const clt = @import("d2-net").clt;
+const world_mod = @import("libd2").client;
+const clt = @import("libd2").net.clt;
 const World = world_mod.World;
 const UnitType = world_mod.UnitType;
 
