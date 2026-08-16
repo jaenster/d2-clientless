@@ -371,6 +371,11 @@ fn recvUntil(fd: Socket, want: u8, out: []u8) ![]const u8 {
                 std.mem.copyForwards(u8, rxbuf[0 .. rxlen - plen], rxbuf[plen..rxlen]);
                 rxlen -= plen;
                 return out[0..blen];
+            } else if (id == SID_CHATEVENT) {
+                // Print it on the way past. The channel user list and everyone's join/leave arrive
+                // while we are waiting for something else entirely, and dropping them silently
+                // made the client look like it had been shown an empty room.
+                printChatEvent(body);
             }
             std.mem.copyForwards(u8, rxbuf[0 .. rxlen - plen], rxbuf[plen..rxlen]);
             rxlen -= plen;
@@ -861,7 +866,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var say_arg: ?[]const u8 = null; // chat message to send after joining
     var kick_arg: ?[]const u8 = null; // user to /kick after joining
     var listen_sec: u32 = 0; // stay in chat reading events for N seconds (chat-session mode)
-    var delay_sec: u32 = 0; // wait N seconds after joining before say/kick (2-client ordering)
+    var say_after_sec: u32 = 0; // wait N seconds after joining before --say/--kick (multi-client ordering)
     var game_arg: ?[]const u8 = null; // --game <name>: create+join the game and enter it on the GS
     var char_arg: ?[]const u8 = null; // --char <name>: which character to log on with (default: first)
     var goto_waypoint = false; // --goto-waypoint: after joining, actually walk to the level's waypoint
@@ -905,8 +910,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             kick_arg = args.next();
         } else if (std.mem.eql(u8, a, "--listen")) {
             listen_sec = std.fmt.parseInt(u32, args.next() orelse "0", 10) catch 0;
-        } else if (std.mem.eql(u8, a, "--delay")) {
-            delay_sec = std.fmt.parseInt(u32, args.next() orelse "0", 10) catch 0;
+        } else if (std.mem.eql(u8, a, "--say-after")) {
+            say_after_sec = std.fmt.parseInt(u32, args.next() orelse "0", 10) catch 0;
         } else if (std.mem.eql(u8, a, "--game")) {
             game_arg = args.next();
         } else if (std.mem.eql(u8, a, "--char")) {
@@ -995,6 +1000,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\  --gs-brute <octets>  fire this game's token at every 201.<oct>:443 gateway; report routers
             \\  --channel <name>     chat channel to join (default "Diablo II")
             \\  --say <text>         send a chat message after entering chat
+            \\  --say-after <sec>    wait N seconds in-channel before --say/--kick (client ordering)
             \\  --kick <user>        /kick a user (needs channel-operator)
             \\  --listen <sec>       stay in chat reading events for N seconds
             \\  --dwell <sec>        seconds to stay in the world before LEAVEGAME (default 12; fractions ok)
@@ -1891,7 +1897,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (listen_sec > 0) {
             setRecvTimeout(fd, 400);
             const start = nowMs();
-            const send_at = start + @as(i64, @intCast(delay_sec)) * 1000;
+            const send_at = start + @as(i64, @intCast(say_after_sec)) * 1000;
             const deadline = start + @as(i64, @intCast(listen_sec)) * 1000;
             var fired = (say_arg == null and kick_arg == null);
             std.debug.print("[chat] joined \"{s}\" — listening {d}s\n", .{ channel_arg, listen_sec });
