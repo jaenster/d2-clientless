@@ -434,6 +434,23 @@ fn eidName(eid: u32) []const u8 {
     };
 }
 
+/// A character name for an account that has none. Derived from the account so several clients in
+/// one test are telling apart in the channel list — a chat identity is the CHARACTER, so a fixed
+/// name makes every account look like the same person. Letters only and capitalised, because the
+/// engine silently refuses anything else (IsValidChecks); an account with no letters in it falls
+/// back to the old fixed name.
+fn charNameFor(account: []const u8, out: *[16]u8) []const u8 {
+    var n: usize = 0;
+    for (account) |c| {
+        if (n == 15) break;
+        const isl = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+        if (!isl) continue;
+        out[n] = if (n == 0 and c >= 'a' and c <= 'z') c - 32 else c;
+        n += 1;
+    }
+    return if (n == 0) "Clientella" else out[0..n];
+}
+
 fn printChatEvent(body: []const u8) void {
     if (body.len < 28) return;
     const eid = std.mem.readInt(u32, body[0..4], .little);
@@ -861,6 +878,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var sig_ok: u8 = 1;
     var keys_arg: ?[]const u8 = null; // "KEY1,KEY2" (26-char each)
     var login_arg: ?[]const u8 = null; // "account:password"
+    var logged_in_account: []const u8 = ""; // the account half, kept for the char-create default
     var create_arg: ?[]const u8 = null; // "account:password" to register first
     var channel_arg: []const u8 = "Diablo II"; // channel to join
     var say_arg: ?[]const u8 = null; // chat message to send after joining
@@ -869,6 +887,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var say_after_sec: u32 = 0; // wait N seconds after joining before --say/--kick (multi-client ordering)
     var game_arg: ?[]const u8 = null; // --game <name>: create+join the game and enter it on the GS
     var char_arg: ?[]const u8 = null; // --char <name>: which character to log on with (default: first)
+    var new_char_arg: ?[]const u8 = null; // name for a character created because the account had none
     var goto_waypoint = false; // --goto-waypoint: after joining, actually walk to the level's waypoint
     // How long to stay in the world once we are in it. 12s is generous enough for the whole
     // world burst plus a look around; a load test wants it far shorter so games turn over fast.
@@ -916,6 +935,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             game_arg = args.next();
         } else if (std.mem.eql(u8, a, "--char")) {
             char_arg = args.next();
+        } else if (std.mem.eql(u8, a, "--new-char")) {
+            new_char_arg = args.next();
         } else if (std.mem.eql(u8, a, "--goto-waypoint")) {
             goto_waypoint = true;
         } else if (std.mem.eql(u8, a, "--dwell")) {
@@ -990,6 +1011,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\game / chat:
             \\  --game <name>        create + join the game and enter it on the GS
             \\  --char <name>        character to log on with (default: the first one listed)
+            \\  --new-char <name>    name for the character made when the account has none
+            \\                       (default: the account name, letters only)
             \\  --goto-waypoint      after joining, walk to this level's waypoint and report
             \\  --gs-port <n>        GS game port (default 4000; 443 when --gs-tls)
             \\  --gs-tls             join the GS over TLS (Blizzard's :443 D2GS-over-TLS farm)
@@ -1183,6 +1206,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (login_arg) |la| {
         const sep = std.mem.indexOfScalar(u8, la, ':') orelse la.len;
         const acct = la[0..sep];
+        logged_in_account = acct;
         const pass = if (sep < la.len) la[sep + 1 ..] else "";
         const inner = xsha1.passwordHash(pass);
         const pwhash = xsha1.doubleHash(CLIENT_TOKEN, stoken, inner);
@@ -1332,7 +1356,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         // ── MCP_CHARCREATE — make a character if the account has none ──
         if (cname_len == 0) {
-            const newname = "Clientella"; // <=15 chars
+            var nb: [16]u8 = undefined;
+            const newname = new_char_arg orelse charNameFor(logged_in_account, &nb);
             var ccb: [64]u8 = undefined;
             std.mem.writeInt(u32, ccb[0..4], 1, .little); // class 1 = Sorceress
             std.mem.writeInt(u16, ccb[4..6], 0x20, .little); // status: 0x20 = expansion (LoD), softcore
