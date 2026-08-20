@@ -382,6 +382,18 @@ pub const Session = struct {
     }
 };
 
+test "GAMELOGON is the 1.14d shape at EVERY engine, because the server translates it" {
+    // There is deliberately no per-version join here. Older engines number it differently — 0x61
+    // at 28 bytes on classic, 0x65 at 29 from 1.07, 0x67 at 1.10f — but d2host rewrites the 1.14d
+    // join into whatever its own D2Net table calls it ("accepting 1.14d clients (join packet
+    // translated)"). So the client speaks one dialect and the SERVER adapts, which is why a stock
+    // 1.14d client reaches every engine we host.
+    //
+    // Asserted rather than commented, because the tempting "fix" if a join ever fails is to make
+    // this version-aware — and doing that would mangle a packet the engine would have accepted.
+    try std.testing.expectEqual(@as(usize, 37), cs.sizeOf(&[_]u8{0x68} ** 40).?);
+}
+
 test "the keep-alive is the size the engine's own C->S table says it is" {
     // A short ping is not rejected, it is misframed — the eight bytes after it are swallowed as
     // part of the packet and every command from then on is read at an offset.

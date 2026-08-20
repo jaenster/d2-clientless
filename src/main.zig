@@ -26,6 +26,7 @@ const bnftp = @import("bnftp");
 const packets = @import("libd2").net.sc;
 const world_mod = @import("libd2").client;
 const bot = @import("game/bot.zig");
+const framing = @import("game/framing.zig");
 const session = @import("d2-session");
 const realm = @import("d2-realm");
 
@@ -308,16 +309,12 @@ fn joinGameMeaning(r: u32) []const u8 {
     };
 }
 
-// S->C packet framing (size table + variable-length derivation) lives in game/packets.zig.
-// Classic (pre-LoD) engines size part of the handshake differently and that table is 1.14d's.
-// 0x01 GameFlags is seven bytes on 1.06b against eight everywhere else; framed as eight it
-// swallows the 0x02 LoadSuccess behind it, and the client then waits for a handshake it has
-// already been sent.
-var classic_sc: bool = false;
+// S->C framing, including the one entry classic sizes differently — see game/framing.zig, where
+// that divergence is spelled out and asserted.
+var sc_era: framing.Era = .lod;
 
 fn scPacketSize(buf: []const u8) ?usize {
-    if (classic_sc and buf.len >= 1 and buf[0] == 0x01) return if (buf.len >= 7) 7 else null;
-    return packets.packetSize(buf);
+    return framing.packetSize(sc_era, buf);
 }
 
 var rxbuf: [16384]u8 = undefined;
@@ -994,9 +991,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 0 => host = a,
                 1 => {
                     product = a;
-                    // A classic product means a classic engine, and those size part of the S->C
-                    // handshake differently from the 1.14d table libd2 carries.
-                    classic_sc = std.mem.eql(u8, a, "D2DV");
+                    // The product a client announces is the statement of which engine family it is
+                    // talking to, and that decides the S->C framing.
+                    sc_era = framing.Era.fromProduct(a);
                 },
                 2 => game_ver = a,
                 else => {},

@@ -96,7 +96,9 @@ pub fn build(b: *std.Build) void {
     // The crypto vectors moved to libd2's d2-bnet with the code they verify; what is left to
     // test here is this repo's own logic.
     const test_step = b.step("test", "Run the unit tests");
-    for ([_][]const u8{"src/game/bot.zig"}) |path| {
+    // Every file with tests has to be named HERE. A test in a file this list does not mention is
+    // compiled by nothing and run by nothing — it looks like coverage and is not.
+    for ([_][]const u8{ "src/game/bot.zig", "src/game/framing.zig" }) |path| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),
