@@ -309,7 +309,16 @@ fn joinGameMeaning(r: u32) []const u8 {
 }
 
 // S->C packet framing (size table + variable-length derivation) lives in game/packets.zig.
-const scPacketSize = packets.packetSize;
+// Classic (pre-LoD) engines size part of the handshake differently and that table is 1.14d's.
+// 0x01 GameFlags is seven bytes on 1.06b against eight everywhere else; framed as eight it
+// swallows the 0x02 LoadSuccess behind it, and the client then waits for a handshake it has
+// already been sent.
+var classic_sc: bool = false;
+
+fn scPacketSize(buf: []const u8) ?usize {
+    if (classic_sc and buf.len >= 1 and buf[0] == 0x01) return if (buf.len >= 7) 7 else null;
+    return packets.packetSize(buf);
+}
 
 var rxbuf: [16384]u8 = undefined;
 var rxlen: usize = 0;
@@ -983,7 +992,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         } else if (!std.mem.startsWith(u8, a, "--")) {
             switch (pos) {
                 0 => host = a,
-                1 => product = a,
+                1 => {
+                    product = a;
+                    // A classic product means a classic engine, and those size part of the S->C
+                    // handshake differently from the 1.14d table libd2 carries.
+                    classic_sc = std.mem.eql(u8, a, "D2DV");
+                },
                 2 => game_ver = a,
                 else => {},
             }
