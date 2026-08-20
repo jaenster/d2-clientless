@@ -283,7 +283,13 @@ pub const Session = struct {
             return tick;
         }
 
-        if (nowMs() >= self.next_ping) self.ping();
+        // Not before we are in the game. The engine has no player unit for a client that has only
+        // sent GAMELOGON, and a 0x6d arriving in that window is not ignored — it answers
+        // `ClientRemoveFromGame: no HUNIT to save ... Disconnect`, so the join dies to the very
+        // keep-alive meant to hold it open. next_ping starts at 0, so this fired on the first poll,
+        // in the same read batch as the join, and the character delivery never got a chance to
+        // land first.
+        if (self.entered and nowMs() >= self.next_ping) self.ping();
 
         var pfd = pollfd{ .fd = self.fd, .events = POLLIN, .revents = 0 };
         const pr = poll(&pfd, 1, budget_ms);
