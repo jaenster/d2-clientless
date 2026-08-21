@@ -18,16 +18,19 @@ pub const Version = sc_versions.Version;
 
 /// The build named on the command line, or null when nobody has read that build's table yet.
 ///
-/// 1.13c maps to 1.14d's table on evidence rather than adjacency: this client has decoded a full
-/// world out of a 1.13c server with it — 179 packets and 53 units, with no resync. The builds that
-/// return null are the ones where that has never been shown, and they are exactly the ones a
-/// neighbour's table would silently hang.
+/// Every one of these is its own measurement. 1.13c is worth pointing at: it used to be mapped to
+/// 1.14d's table because a world had been decoded through it, and that worked — but its table is
+/// 182 entries against 1.14d's 181, so "it worked" was luck about which opcodes turned up rather
+/// than the two being the same.
 pub fn fromEngine(name: []const u8) ?Version {
     const map = .{
         .{ "1.06b", Version.v106b },
         .{ "1.07", Version.v107 },
+        .{ "1.08", Version.v108 },
+        .{ "1.09b", Version.v109b },
+        .{ "1.09d", Version.v109d },
         .{ "1.10f", Version.v110f },
-        .{ "1.13c", Version.v114d },
+        .{ "1.13c", Version.v113c },
         .{ "1.14d", Version.v114d },
     };
     inline for (map) |e| {
@@ -47,11 +50,12 @@ test "the builds this client can frame, and the ones it refuses to guess at" {
     try std.testing.expectEqual(@as(?Version, .v107), fromEngine("1.07"));
     try std.testing.expectEqual(@as(?Version, .v110f), fromEngine("1.10f"));
     try std.testing.expectEqual(@as(?Version, .v114d), fromEngine("1.14d"));
-    // Never measured. Answering .v107 here would frame 1.08 with 1.07's table and hang if any
-    // entry moved — the failure this whole file exists to stop.
-    try std.testing.expectEqual(@as(?Version, null), fromEngine("1.08"));
-    try std.testing.expectEqual(@as(?Version, null), fromEngine("1.09b"));
-    try std.testing.expectEqual(@as(?Version, null), fromEngine("1.09d"));
+    try std.testing.expectEqual(@as(?Version, .v108), fromEngine("1.08"));
+    try std.testing.expectEqual(@as(?Version, .v109b), fromEngine("1.09b"));
+    try std.testing.expectEqual(@as(?Version, .v113c), fromEngine("1.13c"));
+    // Still refused rather than guessed at: no D2Net for these has been read.
+    try std.testing.expectEqual(@as(?Version, null), fromEngine("1.00"));
+    try std.testing.expectEqual(@as(?Version, null), fromEngine("1.11b"));
 }
 
 test "GameFlags is framed by the build, and the LoadSuccess behind it survives" {

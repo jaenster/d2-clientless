@@ -1770,7 +1770,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         //   • our standalone: fire on 0x00 StateCommand.
                         //   • real 1.14d engine: fire on 0x0b HandShake.
                         // 0x02 kept for older captures where the server echoed a LoadSuccess back.
-                        if ((id == 0x00 or id == 0x02 or id == 0x0b) and !sent6b) {
+                        // A classic engine sends GameFlags and then waits: there is no 0x00
+                        // StateCommand behind it, so a client that only fires on 0x00/0x02/0x0b
+                        // sits there while the server sits there. Firing on 0x01 is wrong for
+                        // every LoD build, which is why it is asked of the build rather than
+                        // added to the set.
+                        const classic_cue = sc_version == .v106b and id == 0x01;
+                        if ((id == 0x00 or id == 0x02 or id == 0x0b or classic_cue) and !sent6b) {
                             pace();
                             try conn.wr(&[_]u8{0x6b});
                             sent6b = true;
