@@ -309,12 +309,12 @@ fn joinGameMeaning(r: u32) []const u8 {
     };
 }
 
-// S->C framing, including the one entry classic sizes differently — see game/framing.zig, where
-// that divergence is spelled out and asserted.
-var sc_era: framing.Era = .lod;
+// Which build's S->C size table frames this stream — see game/framing.zig. Defaults to 1.14d and
+// is moved by --engine, because nothing in the stream announces the build.
+var sc_version: framing.Version = .v114d;
 
 fn scPacketSize(buf: []const u8) ?usize {
-    return framing.packetSize(sc_era, buf);
+    return framing.packetSize(sc_version, buf);
 }
 
 var rxbuf: [16384]u8 = undefined;
@@ -688,6 +688,7 @@ fn mephRun(gpa: std.mem.Allocator, hostport: ?[]const u8, gameid_arg: ?[]const u
         .game_id = gameid,
         .character = "Bot",
         .char_class = 1, // Sorceress
+        .sc_version = sc_version,
     }) catch {
         std.debug.print("[meph] connect to {s}:{d} failed\n", .{ host, port });
         return;
@@ -814,6 +815,7 @@ fn playRuns(gpa: std.mem.Allocator, plan: Plan) !void {
             .game_hash = ticket.hash,
             .character = who.name(),
             .char_class = who.class,
+            .sc_version = sc_version,
         }) catch |e| {
             std.debug.print("[run {d}/{d}] \"{s}\" GS connect failed: {s}\n", .{ run, plan.runs, name, @errorName(e) });
             continue;
@@ -967,6 +969,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             gs_brute = args.next();
         } else if (std.mem.eql(u8, a, "--emit-join")) {
             gs_emit = true;
+        } else if (std.mem.eql(u8, a, "--engine")) {
+            const name = args.next() orelse "";
+            sc_version = framing.fromEngine(name) orelse {
+                std.debug.print("no measured S->C table for engine \"{s}\".\n" ++
+                    "Read it out of that build's D2Net.dll with libd2 scripts/gen_sc_versions.py —\n" ++
+                    "framing it with a neighbour's table hangs on the handshake instead of failing.\n", .{name});
+                return;
+            };
         } else if (std.mem.eql(u8, a, "--verbyte")) {
             ver_byte = std.fmt.parseInt(u8, args.next() orelse "0", 10) catch 0;
         } else if (std.mem.eql(u8, a, "--port")) {
@@ -989,12 +999,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         } else if (!std.mem.startsWith(u8, a, "--")) {
             switch (pos) {
                 0 => host = a,
-                1 => {
-                    product = a;
-                    // The product a client announces is the statement of which engine family it is
-                    // talking to, and that decides the S->C framing.
-                    sc_era = framing.Era.fromProduct(a);
-                },
+                1 => product = a,
                 2 => game_ver = a,
                 else => {},
             }
@@ -1041,6 +1046,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\
             \\connection / debug:
             \\  --port <n>           BNCS port (default 6112)
+            \\  --engine <ver>       which build's S->C table to frame with (default 1.14d)
             \\  --verbyte <n>        GAMELOGON version byte (default 14 = 1.14d)
             \\  --delay <ms>         pause before each step (gentler pacing; e.g. 500)
             \\  --verbose            hexdump all BNCS + MCP traffic + GS packets
@@ -1764,7 +1770,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         //   • our standalone: fire on 0x00 StateCommand.
                         //   • real 1.14d engine: fire on 0x0b HandShake.
                         // 0x02 kept for older captures where the server echoed a LoadSuccess back.
-                        if ((id == 0x00 or id == 0x02 or id == 0x0b) and !sent6b) {
+                        // A classic engine sends GameFlags and then waits: there is no 0x00
+                        // StateCommand behind it, so a client that only fires on 0x00/0x02/0x0b
+                        // sits there while the server sits there. Firing on 0x01 is wrong for
+                        // every LoD build, which is why it is asked of the build rather than
+                        // added to the set.
+                        const classic_cue = sc_version == .v106b and id == 0x01;
+                        if ((id == 0x00 or id == 0x02 or id == 0x0b or classic_cue) and !sent6b) {
                             pace();
                             try conn.wr(&[_]u8{0x6b});
                             sent6b = true;

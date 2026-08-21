@@ -1,81 +1,80 @@
-//! S->C framing, and the one thing about it that is not the same on every engine.
+//! Which build's S->C size table this client frames with, and how it is chosen.
 //!
-//! libd2 carries 1.14d's size table, which is right for every expansion build. Classic differs in
-//! exactly one entry: `0x01` GameFlags is SEVEN bytes there against eight everywhere else. Framed
-//! as eight it swallows the `0x02` LoadSuccess sitting behind it, and the client then waits
-//! forever for a handshake the server already sent — a hang with nothing in the log to explain it.
+//! The table itself lives in libd2 (`net.sc_versions`), read out of each build's own D2Net.dll.
+//! This file is only the choice, and the choice is the part that used to be wrong: it was a
+//! two-value `classic`/`lod` split with one hand-found divergence, inferred from debugging a hang
+//! rather than read from a binary. Both halves of it turned out to be wrong. `0x01` GameFlags is
+//! SIX bytes on 1.06b, not the seven the classic branch used, and SEVEN on 1.07 through 1.09,
+//! which the `lod` branch framed as eight. So every build before 1.10f desynced on the first
+//! packet of the handshake, which is why none of them has ever been driven to a world.
 //!
-//! This lives in its own file, and takes the era as an argument rather than reading a global,
-//! because the whole failure mode is one table entry being wrong for one family of builds. That is
-//! worth being able to assert on directly.
+//! There is no negotiation to lean on here — nothing in the stream announces the build — so the
+//! caller has to say. An unmeasured build is an error rather than a guess at its neighbour's
+//! table, because guessing is what produced a hang with nothing in the log to explain it.
 const std = @import("std");
-const sc = @import("libd2").net.sc;
+const sc_versions = @import("libd2").net.sc_versions;
 
-/// Which S->C table a server speaks. Classic covers 1.00-1.06b; every expansion build is `lod`.
-pub const Era = enum {
-    classic,
-    lod,
+pub const Version = sc_versions.Version;
 
-    /// The product code a client announces IS the statement of which one it is talking to: D2DV is
-    /// classic, D2XP is expansion. Anything else is treated as expansion, since that is what every
-    /// build from 1.07 on speaks.
-    pub fn fromProduct(product: []const u8) Era {
-        return if (std.mem.eql(u8, product, "D2DV")) .classic else .lod;
+/// The build named on the command line, or null when nobody has read that build's table yet.
+///
+/// Every one of these is its own measurement. 1.13c is worth pointing at: it used to be mapped to
+/// 1.14d's table because a world had been decoded through it, and that worked — but its table is
+/// 182 entries against 1.14d's 181, so "it worked" was luck about which opcodes turned up rather
+/// than the two being the same.
+pub fn fromEngine(name: []const u8) ?Version {
+    const map = .{
+        .{ "1.06b", Version.v106b },
+        .{ "1.07", Version.v107 },
+        .{ "1.08", Version.v108 },
+        .{ "1.09b", Version.v109b },
+        .{ "1.09d", Version.v109d },
+        .{ "1.10f", Version.v110f },
+        .{ "1.13c", Version.v113c },
+        .{ "1.14d", Version.v114d },
+    };
+    inline for (map) |e| {
+        if (std.mem.eql(u8, name, e[0])) return e[1];
     }
-};
+    return null;
+}
 
 /// Length of the packet at the head of `buf`, or null when more bytes are needed to tell.
-/// Zero means the opcode is unknown and the stream cannot be resynchronised.
-pub fn packetSize(era: Era, buf: []const u8) ?usize {
-    if (era == .classic and buf.len >= 1 and buf[0] == 0x01) {
-        return if (buf.len >= 7) 7 else null;
-    }
-    return sc.packetSize(buf);
+/// Zero means the opcode is unknown to this build and the stream cannot be resynchronised.
+pub fn packetSize(v: Version, buf: []const u8) ?usize {
+    return sc_versions.packetSize(v, buf);
 }
 
-test "0x01 GameFlags is seven bytes on classic and eight on expansion" {
-    const wire = [_]u8{ 0x01, 1, 2, 3, 4, 5, 6, 7 };
-    try std.testing.expectEqual(@as(?usize, 7), packetSize(.classic, &wire));
-    try std.testing.expectEqual(@as(?usize, 8), packetSize(.lod, &wire));
+test "the builds this client can frame, and the ones it refuses to guess at" {
+    try std.testing.expectEqual(@as(?Version, .v106b), fromEngine("1.06b"));
+    try std.testing.expectEqual(@as(?Version, .v107), fromEngine("1.07"));
+    try std.testing.expectEqual(@as(?Version, .v110f), fromEngine("1.10f"));
+    try std.testing.expectEqual(@as(?Version, .v114d), fromEngine("1.14d"));
+    try std.testing.expectEqual(@as(?Version, .v108), fromEngine("1.08"));
+    try std.testing.expectEqual(@as(?Version, .v109b), fromEngine("1.09b"));
+    try std.testing.expectEqual(@as(?Version, .v113c), fromEngine("1.13c"));
+    // Still refused rather than guessed at: no D2Net for these has been read.
+    try std.testing.expectEqual(@as(?Version, null), fromEngine("1.00"));
+    try std.testing.expectEqual(@as(?Version, null), fromEngine("1.11b"));
 }
 
-test "classic does not swallow the 0x02 LoadSuccess riding behind GameFlags" {
-    // The exact shape that hung 1.06b: GameFlags and LoadSuccess arriving in one read.
-    const wire = [_]u8{ 0x01, 1, 2, 3, 4, 5, 6, 0x02 };
-
-    const first = packetSize(.classic, &wire).?;
-    try std.testing.expectEqual(@as(usize, 7), first);
-    // The byte after it must still be seen as its own packet, not eaten as GameFlags' eighth.
-    try std.testing.expectEqual(@as(u8, 0x02), wire[first]);
-    try std.testing.expectEqual(@as(?usize, 1), packetSize(.classic, wire[first..]));
-
-    // Read with the expansion table, the same bytes are ONE packet and LoadSuccess is lost —
-    // which is the bug, asserted so it cannot come back unnoticed.
-    try std.testing.expectEqual(@as(?usize, 8), packetSize(.lod, &wire));
-}
-
-test "a partial GameFlags asks for more bytes rather than guessing, in both eras" {
-    const six = [_]u8{ 0x01, 1, 2, 3, 4, 5 };
-    try std.testing.expectEqual(@as(?usize, null), packetSize(.classic, &six));
-    try std.testing.expectEqual(@as(?usize, null), packetSize(.lod, &six));
-    try std.testing.expectEqual(@as(?usize, null), packetSize(.classic, &[_]u8{}));
-}
-
-test "every other opcode is framed identically in both eras" {
-    // 0x01 is the ONLY divergence. If a second one ever appears this fails and says so, rather
-    // than the client quietly desynchronising against one family of servers.
-    var buf: [64]u8 = [_]u8{0} ** 64;
-    var op: usize = 0;
-    while (op <= 0xff) : (op += 1) {
-        if (op == 0x01) continue;
-        buf[0] = @intCast(op);
-        try std.testing.expectEqual(packetSize(.lod, &buf), packetSize(.classic, &buf));
+test "GameFlags is framed by the build, and the LoadSuccess behind it survives" {
+    // The exact wire shape that hung 1.06b, now for every era: GameFlags and LoadSuccess in one
+    // read. One byte too long and the handshake is eaten.
+    for ([_]struct { v: Version, n: usize }{
+        .{ .v = .v106b, .n = 6 },
+        .{ .v = .v107, .n = 7 },
+        .{ .v = .v110f, .n = 8 },
+        .{ .v = .v114d, .n = 8 },
+    }) |c| {
+        var wire = [_]u8{ 0x01, 1, 2, 3, 4, 5, 6, 7, 0 };
+        wire[c.n] = 0x02;
+        try std.testing.expectEqual(@as(?usize, c.n), packetSize(c.v, wire[0 .. c.n + 1]));
+        try std.testing.expectEqual(@as(u8, 0x02), wire[c.n]);
     }
 }
 
-test "the product code decides the era" {
-    try std.testing.expectEqual(Era.classic, Era.fromProduct("D2DV"));
-    try std.testing.expectEqual(Era.lod, Era.fromProduct("D2XP"));
-    // Not a classic product, so framed the way every 1.07+ build speaks.
-    try std.testing.expectEqual(Era.lod, Era.fromProduct(""));
+test "a partial GameFlags asks for more bytes rather than guessing" {
+    try std.testing.expectEqual(@as(?usize, null), packetSize(.v110f, &[_]u8{ 0x01, 1, 2, 3, 4, 5 }));
+    try std.testing.expectEqual(@as(?usize, null), packetSize(.v106b, &[_]u8{}));
 }

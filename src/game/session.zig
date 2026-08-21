@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const sc = @import("libd2").net.sc;
+const sc_versions = @import("libd2").net.sc_versions;
 const cs = @import("libd2").net.cs;
 const client = @import("libd2").client;
 const World = client.World;
@@ -56,6 +57,9 @@ pub const JoinOptions = struct {
     ready_timeout_ms: i64 = 15000,
     /// How long to wait for the server's 0xAF greeting before sending GAMELOGON anyway.
     greet_timeout_ms: i64 = 5000,
+    /// Which build's S->C size table to frame the stream with. Nothing in the stream announces it,
+    /// so the caller says; framing with the wrong one hangs on the handshake rather than erroring.
+    sc_version: sc_versions.Version = .v114d,
 };
 
 /// Told about every packet as it is applied, before the world sees it.
@@ -95,6 +99,11 @@ pub const Session = struct {
     len: usize = 0,
     /// The unframed 2-byte 0xAF greeting has been consumed; everything after it is framed.
     greeted: bool = false,
+    /// Which build's S->C size table frames this stream. It is not cosmetic and it is not
+    /// negotiated: `0x01` GameFlags is six bytes on 1.06b, seven through 1.09 and eight from 1.10f
+    /// on, so a stream framed with the wrong build's table eats the `0x02` LoadSuccess riding
+    /// behind GameFlags and the session waits forever for a handshake it was already sent.
+    sc_version: sc_versions.Version = .v114d,
     /// Bytes skipped across the whole session because no opcode framed there. Non-zero means the
     /// S->C stream desynced and everything after it is guesswork.
     resynced: u32 = 0,
@@ -134,6 +143,7 @@ pub const Session = struct {
             .fd = fd,
             .world = World.init(gpa),
             .buf = try gpa.alloc(u8, 64 * 1024),
+            .sc_version = opts.sc_version,
         };
         errdefer self.deinit();
         self.world.expectLocalPlayer(opts.character);
@@ -318,7 +328,7 @@ pub const Session = struct {
                 }
                 self.greeted = true; // no greeting on this dialect — read it as raw from here
             }
-            const n = sc.packetSize(self.buf[off..self.len]) orelse break; // need more bytes
+            const n = sc_versions.packetSize(self.sc_version, self.buf[off..self.len]) orelse break;
             if (n == 0) {
                 // An opcode the size table does not know. There is no length to skip by, so the
                 // rest of this read is unreadable; resync a byte rather than pretending.
