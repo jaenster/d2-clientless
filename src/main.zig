@@ -908,7 +908,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var gs_pin: ?[]const u8 = null; // --gs-pin: only proceed if the GS IP's last octet is in this list
     var gs_brute: ?[]const u8 = null; // --gs-brute: fire this game's token at every 201.<oct>:443 gateway
     var gs_emit = false; // --emit-join: print JOINEMIT token/hash line and exit (for external bruteforce)
-    var ver_byte: u8 = 0x0e; // GAMELOGON nVerByte — GET_GameVersion() returns 0xe (14) for 1.14d
+    // --verbyte: which build this client claims to be, in BOTH places a build is announced — the
+    // product version byte in SID_AUTH_INFO and GAMELOGON's nVerByte. 0xe (14) is 1.14d.
+    var ver_byte: u8 = 0x0e;
     var bnet_port: u16 = 6112; // BNCS port to connect to (--port)
     var force_checkrev = false; // --force-checkrev: respond even if the MPQ isn't the one we implement
     // --runs <n>: play n games back to back on ONE login, leaving each properly before the next.
@@ -1047,7 +1049,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\connection / debug:
             \\  --port <n>           BNCS port (default 6112)
             \\  --engine <ver>       which build's S->C table to frame with (default 1.14d)
-            \\  --verbyte <n>        GAMELOGON version byte (default 14 = 1.14d)
+            \\  --verbyte <n>        which build to claim to be, in SID_AUTH_INFO and GAMELOGON
+            \\                       (default 14 = 1.14d; 6=1.06b, 7=1.07, 8=1.08, 9=1.09, 10=1.10)
             \\  --delay <ms>         pause before each step (gentler pacing; e.g. 500)
             \\  --verbose            hexdump all BNCS + MCP traffic + GS packets
             \\
@@ -1108,7 +1111,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // ── SID_AUTH_INFO ──
     var body: [128]u8 = undefined;
     var w: usize = 0;
-    for ([_]u32{ 0, fourcc("IX86"), fourcc(product), 0x0E, 0, 0, 0, 0, 0 }) |v| {
+    // The product version byte, and it is the SAME number the GAMELOGON below carries — a real
+    // client is one build and says so in both places. It matters on a realm hosting several
+    // engines: this is the field it reads to decide which fleet a character belongs to, so
+    // leaving it pinned at 0x0e made every clientless run a 1.14d client whatever --verbyte said,
+    // and a pre-1.14 era could not be reached at all.
+    for ([_]u32{ 0, fourcc("IX86"), fourcc(product), ver_byte, 0, 0, 0, 0, 0 }) |v| {
         std.mem.writeInt(u32, body[w..][0..4], v, .little);
         w += 4;
     }
