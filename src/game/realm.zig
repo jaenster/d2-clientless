@@ -120,6 +120,25 @@ fn fourcc(s: []const u8) u32 {
     return @as(u32, s[3]) | (@as(u32, s[2]) << 8) | (@as(u32, s[1]) << 16) | (@as(u32, s[0]) << 24);
 }
 
+/// "1.14.3.71" as the dword the game sends: one byte per part, the first the most significant. 0 when it is not four
+/// numbers.
+fn packVersion(text: []const u8) u32 {
+    var v: u32 = 0;
+    var parts: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '.');
+    while (it.next()) |p| : (parts += 1) {
+        const n = std.fmt.parseInt(u8, p, 10) catch return 0;
+        v = (v << 8) | n;
+    }
+    return if (parts == 4) v else 0;
+}
+
+test "a game version is the dword the game sends" {
+    try std.testing.expectEqual(@as(u32, 0x010E0347), packVersion("1.14.3.71"));
+    try std.testing.expectEqual(@as(u32, 0), packVersion("1.14"));
+    try std.testing.expectEqual(@as(u32, 0), packVersion("1.14.x.71"));
+}
+
 fn cstrAt(b: []const u8, off: usize) []const u8 {
     if (off >= b.len) return "";
     const end = std.mem.indexOfScalarPos(u8, b, off, 0) orelse b.len;
@@ -317,6 +336,13 @@ pub const Realm = struct {
             exe_info = full[4..];
             self.say("[checkrev] response=\"{s}\"  -> exeHash=0x{x:0>8}  exeInfo=\"{s}\"\n", .{ full, exe_hash, exe_info });
         }
+
+        // The EXE version dword a real client sends in SID_AUTH_CHECK is the game's own version, 1.14.3.71 as
+        // 0x010E0347. A realm that resolves the engine from it (d2up's does, and stamps the engine on every
+        // character the session saves) otherwise sees none, and a character saved under none is refused at its
+        // next join.
+        const real_version = packVersion(opts.game_version);
+        if (real_version != 0) exe_version = real_version;
 
         var cb: [512]u8 = undefined;
         var nkeys: u32 = 0;
