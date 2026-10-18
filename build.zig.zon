@@ -15,8 +15,8 @@
     // of whatever happens to be checked out next door.
     .dependencies = .{
         .libd2 = .{
-            .url = "git+https://github.com/jaenster/libd2?ref=v0.6.4#68df6c9a1fbb52ca3221aaa048f57315f446ddcd",
-            .hash = "libd2-0.6.4-wboU7Xf5pgHE4EqmtWHc7C8IiyEyMQm-15tsj5Ua2ga9",
+            .url = "git+https://github.com/jaenster/libd2?ref=v0.6.4#6e3ba0c3224cb610458b1636da61c35bdee95906",
+            .hash = "libd2-0.6.4-wboU7TH4pgHk0P09A1XVbZGwHmaPL8rn0ogGAcekmm9U",
         },
     },
     .paths = .{
